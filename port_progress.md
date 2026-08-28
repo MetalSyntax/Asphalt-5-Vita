@@ -846,6 +846,14 @@ El juego ya corre sin crashes y a máxima velocidad, pero el audio se escucha "e
 **Causa raíz:** Al configurar los hilos de audio para usar los otros núcleos, les asigné la prioridad `0x10000100`. En la vieja PSP, ese número significaba "Prioridad Normal de Usuario". Sin embargo, en el sistema operativo moderno de PS Vita, los números de prioridad van del 0 al 255. Darle un número gigante y fuera de estándar como `0x10000100` hace que el sistema operativo de la Vita lo trate como un hilo "inválido" o de la más bajísima prioridad posible (255). Esto provocaba que, a pesar de estar en el Core 1, el OS interrumpiera el audio constantemente para hacer micro-tareas del sistema.
 **Fix:** Cambié la prioridad de los hilos reproductores de audio en `audio.cpp` y `video.cpp` de `0x10000100` a `0x40` (64). En la arquitectura de Vita, 64 es el estándar para "Prioridad Alta en Tiempo Real". Ahora el hilo de audio le exige al Core 1 que no lo interrumpa por ningún motivo, entregando un sonido limpio y continuo.
 
+### Bug #21 -- Rendimiento atascado en 3 FPS debido a "Cache Trashing"
+
+Con el disco supuestamente liberado del `replay.sav`, el juego seguía funcionando a unos incomprensibles 3 FPS durante la carrera.
+
+**Causa raíz:** Originalmente, había limitado la Caché de RAM interna (`RAM_CACHE_SLOTS`) a **48 archivos** de 1MB para no exceder la memoria de la consola. Sin embargo, al analizar el último log, descubrí que Asphalt 5 utiliza alrededor de **93 archivos de 1MB** durante una carrera.
+Al tener solo 48 espacios de caché, el sistema cargaba los archivos, pero los borraba inmediatamente para cargar los siguientes. Cuando el motor volvía a pedir el archivo borrado, ¡el juego se veía obligado a **volver a leerlo completo de la tarjeta SD**! Esta constante recarga de archivos desde la lenta SD en cada frame (un fenómeno conocido como "Cache Trashing") bloqueaba el juego por 250-300 milisegundos en cada petición, colapsando el juego a 3 FPS.
+**Fix:** Al revisar la asignación total de RAM, comprobé que Vita SDK nos da 256MB por defecto. Aumenté agresivamente `RAM_CACHE_SLOTS` de 48 a **128**. Ahora, los 93 megabytes de texturas y geometría de Gameloft caben completamente en la memoria súper-rápida de la consola de forma simultánea. ¡Ya no hay ni un solo byte de lectura en la tarjeta SD durante la carrera!
+
 `RES_PATH`, 14.8 MB) nunca llegó a reproducirse ni una vez, así que el
 logo+trailer que contiene nunca se vio. `GS_LoadMainMenu::Render()` sí hace
 render real (sprites, texto -- no es un no-op), así que la pantalla de
