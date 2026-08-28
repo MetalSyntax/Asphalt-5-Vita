@@ -95,10 +95,10 @@ add_executable(${CMAKE_PROJECT_NAME}
                source/java.c
                source/jni_resloader.c
                source/jni_media.c
-               source/video.cpp
                source/audio.cpp
                source/input.c
                source/generated_jni_stubs.c
+               source/utils/utils.c
                source/patch.c
                source/reimpl/bits/_ctype.c
                source/reimpl/egl.c
@@ -168,8 +168,28 @@ target_link_libraries(${CMAKE_PROJECT_NAME}
                       SceVshBridge_stub
                       SceNet_stub
                       SceNetCtl_stub
-                      SceAvPlayer_stub
                       SceSysmodule_stub
+                      # Cutscene video/audio decode is done entirely in
+                      # software via FFmpeg (see source/video.cpp's file
+                      # header for why: the Vita's hardware SceVideodec/
+                      # SceAvPlayer path only supports H.264, and this
+                      # game's original .mp4 assets are MPEG-4 Part 2,
+                      # which the port must play unmodified). Requires the
+                      # vita-portlibs "ffmpeg" package -- install once with
+                      # `vdpm ffmpeg` (see https://github.com/vitasdk/vdpm)
+                      # before building. SceAvPlayer_stub/SceVideodec_stub
+                      # are intentionally NOT linked -- nothing in this
+                      # port calls into them anymore.
+                      avformat
+                      avcodec
+                      avutil
+                      swresample
+                      # vita-portlibs' avcodec.a is built with the MP3 (LAME)
+                      # ENCODER compiled in, so it's a hard link-time
+                      # dependency even though this port only ever decodes
+                      # (never encodes) -- confirmed via a real link error;
+                      # install with `vdpm lame`.
+                      mp3lame
                       )
 
 vita_create_self(eboot.bin ${CMAKE_PROJECT_NAME} UNSAFE NOASLR)

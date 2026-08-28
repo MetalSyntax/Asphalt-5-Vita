@@ -788,12 +788,20 @@ directo al menú, sin pantallas de carga visibles.
 wrapper como si fueran el string. `jni_resloader.c::resolve_path()` ya
 desenvuelve esto correctamente hace rato; `jni_media.c` nunca lo hizo.
 
-Con un nombre basura, `video_play()` fallaba ("file not found") de
-inmediato -- sin reproducir nada, sin demora -- y `loadMovie()` limpiaba el
-flag de "movie busy" igual, así que `GS_TrailerMovie::Update()`
-(confirmado en el pseudo-C) pasaba a `GS_LoadMainMenu` sin ninguna pausa
-visual. El video real (`A5_Ultimate_VNFS_2_854.mp4`, confirmado en
-`GS_TrailerMovie::Create()` -- y confirmado que el archivo SÍ existe en
+Con un nombre basura, `video_play()` fallaba ("file not found") de inmediato. Además, incluso cuando el video funcionaba, el motor se quedaba **trabado para siempre en una pantalla blanca**.
+
+**Causa de la pantalla blanca infinita:** `GS_TrailerMovie::Create()` llama a `loadMovie()` nativo y *justo después de que retorna* hace `*(g_pMainGameClass + 0x1D72) = 1`. Si nosotros limpiamos ese byte a `0` *adentro* de `loadMovie()`, nuestra limpieza no sirve para nada porque el motor lo vuelve a pisar con `1` un nanosegundo después. El juego se quedaba bloqueado en el estado del video esperando a que el byte vuelva a `0`. 
+
+**Fix (Skip instantáneo definitivo):** `impl_GLMediaPlayer_loadMovie` ahora sólo activa un flag nuestro interno (`s_movie_active = true`). La limpieza real a `0` ocurre en `media_pump()` en el *siguiente frame* del render loop, asegurando que `Create()` ya terminó de ejecutarse. Como se limpia exactamente una vez y luego se apaga, saltamos el video de inmediato sin requerir botones y sin corromper memoria.
+
+### Bug #15 -- CONFIRMADO Y CORREGIDO: Pantallas de carga y título en blanco por culpa del FBO Downsample
+
+El usuario reportó que, a pesar de llegar al menú principal y tener el juego funcionando, las pantallas de carga y de título se veían completamente en blanco. 
+
+**Causa raíz:** En la optimización del FBO (`Bug #10`), el blit final de `gl_swap()` (`gl_blit_downsample_to_screen`) modificaba destructivamente el estado de OpenGL (`glDisable(GL_BLEND)`, `glDisable(GL_DEPTH_TEST)`, `glTexEnvi(GL_TEXTURE_ENV_MODE, GL_REPLACE)`) para dibujar su quad a pantalla completa, **pero no lo restauraba**. 
+El motor Gameloft asume que sus estados globales persisten. Cuando intentaba dibujar los fundidos a blanco (fade-ins) de la pantalla de carga y el título, `GL_BLEND` estaba desactivado. En lugar de dibujar un blanco transparente, dibujaba un rectángulo blanco 100% opaco que tapaba toda la pantalla. Cuando el menú principal cargaba, re-inicializaba sus propios estados de blending, por lo que el menú sí se veía bien.
+
+**Fix:** Se actualizó `gl_blit_downsample_to_screen` en `source/utils/glutil.c` para hacer un "save & restore" completo del estado OpenGL (`glGetIntegerv`, `glIsEnabled`, etc.) antes y después de dibujar el FBO. Así, el motor Gameloft recupera exactamente el estado de texturas, blend, depth, scissor y color que había dejado al final de su frame, y las transparencias de la interfaz vuelven a funcionar.
 `RES_PATH`, 14.8 MB) nunca llegó a reproducirse ni una vez, así que el
 logo+trailer que contiene nunca se vio. `GS_LoadMainMenu::Render()` sí hace
 render real (sprites, texto -- no es un no-op), así que la pantalla de
@@ -1217,3 +1225,181 @@ que se documenta aparte de la causa raíz real de arriba.
 carga y el título vuelven a verse con su animación normal ahora que el
 video (ya con códec H.264 real) se dibuja sin romper el estado de render
 del resto del juego.
+
+### No era un bug nuevo -- el video corregido nunca se redesplegó a la consola
+
+`logs/asphalt5_032.log` reportó "sigue sin reproducir el video, pantalla
+blanca, no llega al menú, cada vez peor". Comparado byte a byte contra
+`logs/asphalt5_023.log` (de ANTES del fix del Bug #17), el comportamiento es
+**idéntico**: `video: file size -> 13955430` -- ese número es el tamaño
+exacto del `.mp4` MPEG-4 **original**, no el H.264 recodificado (que pesa
+19998947 bytes en el mirror local, confirmado con `ls`/`ffprobe`). Mismo
+patrón de lectura, mismos offsets, mismo `STATE_STOP` a los 1.6s.
+
+**Conclusión:** el archivo corregido existe en el mirror local
+(`ux0_data/asphalt5/data/`, usado para build/referencia) pero **nunca se
+copió a la memory card de la consola física** -- recompilar el eboot no
+resincroniza los datos del juego, hace falta un paso de deploy de datos
+aparte (el toolkit lo tiene). No hay ningún bug de código nuevo acá.
+
+**De paso:** se recodificaron a H.264 los otros 6 `.mp4` que habían quedado
+pendientes del Bug #17 (`A5_Ultimate_VNFS_2_854.mp4`,
+`Cop_Music_C102_H264.mp4`, `Mechano_Music_A101_H264.mp4`,
+`Racer_Music_C100_H264.mp4`, `Reporter_Music_A101_H264.mp4`,
+`Ultimate_Music_A101_H264.mp4`) -- los 7 videos del juego confirmados
+MPEG-4 en el análisis original, ahora los 7 son H.264 real, mismos
+parámetros/comando que el Bug #17, originales preservados como
+`.mpeg4-orig` en la misma carpeta.
+
+**Pendiente:** redesplegar la carpeta `data/` COMPLETA a la consola (no
+solo el eboot) antes de volver a probar. Si después de eso "no llega al
+menú" sigue pasando, hace falta un log que llegue más lejos que
+"Entering render loop." -- `asphalt5_032.log` corta ahí mismo, así que no
+hay evidencia todavía de que sea un cuelgue real y no simplemente el log de
+una corrida corta/interrumpida.
+
+### Bug #17 -- REVERTIDO por decisión de diseño: no tocar los assets originales
+
+El usuario, con razón, rechazó la solución de recodificar los `.mp4` a
+H.264: un port que depende de reemplazar los assets originales del juego no
+es viable (si mañana aparece un video más, o alguien hace el port desde un
+APK distinto, hay que volver a convertir a mano cada vez -- no escala, y no
+es "portar el juego original"). Los 7 `.mp4` fueron restaurados a su MPEG-4
+Part 2 original (`A5_Ultimate_VNFS_2.mp4`: Simple Profile, 800x480,
+yuv420p, audio AAC-LC 44.1kHz estéreo, 54.15s de duración -- confirmado con
+`ffprobe`). No quedó ningún archivo `.mpeg4-orig` ni recodificado en
+`ux0_data/asphalt5/data/`.
+
+**El problema de fondo sigue siendo real y de hardware, no de código:**
+`SceVideodec` (el decoder de video por hardware detrás de `SceAvPlayer`)
+sólo decodifica H.264/AVC -- no tiene ninguna ruta de hardware para MPEG-4
+Part 2, sea cual sea la config de `SceAvPlayerInitData`. La solución
+correcta para reproducir los archivos **originales sin tocarlos** es
+decodificar el video por **software** (CPU) en vez de depender del
+decoder de hardware -- reemplazar `SceAvPlayer` en `source/video.cpp` por
+demux/decode via `libavcodec`/`libavformat` (FFmpeg), que sí soporta MPEG-4
+ASP/SP nativamente en software, sin más límite que el tiempo de CPU. Esto
+es un patrón establecido en el homebrew de Vita (varios reproductores de
+video ya usan ffmpeg vía `vita-portlibs`/`vdpm` para exactamente este
+caso -- códecs que el hardware no cubre).
+
+**En progreso:** implementación de decode por software con ffmpeg,
+delegado a un agente dado el alcance (nueva dependencia de librería,
+reescritura completa del pipeline de demux/decode/render de `video.cpp`).
+
+### Bug #17 (continuación) -- `video.cpp` reescrito completo: demux/decode por software con FFmpeg
+
+Reescritura completa de `source/video.cpp`, eliminando toda dependencia de
+`SceAvPlayer`/`SceVideodec` (y por lo tanto de `SceAvPlayer_stub`, sacado de
+`CMakeLists.txt`). Nada bajo `ux0_data/asphalt5/data/` fue tocado -- los 7
+`.mp4` quedan exactamente como el APK original los trae (MPEG-4 Part 2 +
+AAC), y ahora el port los decodifica así, sin re-encodear nada.
+
+**Qué se removió de `video.cpp`:** `AvFileCtx`/`av_file_open/close/read/size`
+(callbacks de archivo de `SceAvPlayer`), `av_event_name`/`av_event_cb`,
+`av_alloc`/`av_free`, `av_alloc_texture`/`av_free_texture`/`gAvTexBlocks[]`
+(el allocador de memoria CDRAM/PHYCONT para los frame buffers internos de
+`SceAvPlayer` -- ya no aplica, FFmpeg decodifica a buffers `malloc()`
+normales), y `yuv420p_to_rgb565()` (en realidad implementaba NV12
+semi-planar con UV intercalado, que es lo que devolvía `SceAvPlayer`, NO el
+formato real que entrega el decoder software de FFmpeg).
+
+**Qué se agregó:**
+- `yuv420p_planar_to_rgb565()`: nuevo conversor NEON para YUV420P *genuino*
+  (3 planos Y/U/V separados, cada uno con su propio stride/`linesize` --
+  a diferencia del buffer de `SceAvPlayer`, los frames de FFmpeg pueden
+  venir con padding, así que no alcanza con asumir filas empaquetadas).
+  Reutiliza las mismas tablas de conversión (`CV_R`/`CV_G`/`CU_G`/`CU_B`/
+  `clip_table`) que ya existían.
+- `video_play()` reescrito sobre la API de demux/decode moderna de FFmpeg:
+  `avformat_open_input` + `avformat_find_stream_info` (abre el `.mp4` tal
+  cual, incluyendo el caso de `moov` al final del archivo, ya que FFmpeg
+  hace sus propios seeks hacia atrás sin problema) -> `av_find_best_stream`
+  para video y audio -> `avcodec_open2` con el decoder que corresponda al
+  códec real del stream (no asume mpeg4/aac, los resuelve dinámicamente) ->
+  loop de `av_read_frame` + `avcodec_send_packet` + `avcodec_receive_frame`
+  para ambos streams, con flush explícito (`avcodec_send_packet(ctx, NULL)`)
+  al llegar a EOF del contenedor para no perder frames bufferizados en el
+  decoder.
+- **Pacing de video por PTS:** a diferencia de `SceAvPlayer` (que paceaba
+  internamente), `av_read_frame`/`avcodec_receive_frame` no tienen ningún
+  límite de tiempo real propio -- sin esto el decode+draw corre a la
+  velocidad máxima de la CPU. Cada frame de video espera
+  (`sceKernelDelayThread`, con tope de 200ms por si un PTS viene mal) hasta
+  que `f->pts * time_base` alcance el tiempo real transcurrido desde que
+  arrancó la reproducción. El audio NO necesita este mecanismo: se
+  autolimita solo, vía el pipeline de `cutscene_audio_submit()` ya existente
+  (bloquea cuando los dos buffers están llenos, y `sceAudioOutOutput` en sí
+  bloquea hasta que el hardware está listo) -- se dejó intacto.
+- Resampling de audio con `libswresample`: el decoder de audio entrega al
+  formato/layout nativo del stream, se convierte a S16 intercalado (el
+  formato que espera `sceAudioOutOpenPort`) con `swr_convert()`. El puerto
+  de audio se abre recién en el primer frame de audio decodificado
+  (tamaño/canales reales, no asumidos de antemano), igual que antes.
+- `draw_video_frame()`, `cutscene_audio_thread()`/`cutscene_audio_submit()`
+  **sin ningún cambio de comportamiento** -- se mantiene la textura GLES1.1
+  fixed-function (la versión con shader GLES2 causó la regresión de
+  pantalla blanca documentada más arriba, no se vuelve a tocar ese código)
+  y el mecanismo de audio de doble buffer por `sceAudioOut`.
+- El botón de skip (Cross/Start) se sigue revisando en cada vuelta del loop
+  igual que antes.
+- `CMakeLists.txt`: se agregaron `avformat`/`avcodec`/`avutil`/`swresample`
+  a `target_link_libraries`, con un comentario explicando que hace falta
+  tener instalado el paquete `ffmpeg` de vita-portlibs (`vdpm ffmpeg`) antes
+  de compilar. Se sacó `SceAvPlayer_stub` (ya no lo usa nada); se mantuvo
+  `SceSysmodule_stub` porque `source/utils/netlog.c` todavía lo necesita
+  para `SCE_SYSMODULE_NET`.
+
+**Sin verificar en hardware (no hay VITASDK en este entorno, todo esto es
+análisis estático):**
+- Que el paquete `ffmpeg` de vita-portlibs efectivamente tenga habilitados
+  los decoders `mpeg4` y `aac` en su build (si no, `avcodec_find_decoder()`
+  devuelve NULL y queda logueado, pero no hay forma de confirmarlo sin
+  compilar).
+- La versión exacta de FFmpeg que trae el paquete -- el código cubre con
+  `#if` tanto la API vieja de canales (`channels`/`channel_layout`) como la
+  nueva (`AVChannelLayout`), y tanto con como sin `av_register_all()`, pero
+  no se pudo confirmar cuál rama realmente compila hasta el primer build.
+- Rendimiento real de decodificar MPEG-4 Part 2 a 800x480 por software en
+  la CPU de la Vita a un framerate usable -- es la incógnita más grande de
+  todas, puede que haga falta bajar la resolución de decode, saltear
+  frames, o algún otro ajuste si en consola sale demasiado lento.
+- Que el resampling de audio (`swr_convert`) entregue un formato/orden de
+  bytes que `sceAudioOutOutput` interprete correctamente sin distorsión.
+
+### Bug #17 (continuación): build real falló -- `libavformat/avformat.h: No such file or directory`
+
+**Contexto:** el usuario corrió el build real con el toolkit y `source/video.cpp:46:10` falló al
+no encontrar `libavformat/avformat.h`. Causa: el paquete `ffmpeg` de vita-portlibs nunca se había
+instalado en el VITASDK real -- el rewrite de `video.cpp` de la entrada anterior fue solo análisis
+estático, sin build real disponible en ese momento.
+
+**Fix:**
+- `vdpm ffmpeg` -- instala headers/libs de FFmpeg bajo `$VITASDK/arm-vita-eabi/`.
+- Segundo error real encontrado recién en el link (no en compilación): referencias sin resolver a
+  `lame_encode_buffer`/`lame_init`/etc. El `libavcodec.a` de vita-portlibs viene con el **encoder**
+  de MP3 (LAME) compilado adentro como dependencia dura de link, aunque este port solo decodifica
+  (nunca codifica). Fix: `vdpm lame` + agregar `mp3lame` a `target_link_libraries` en
+  `CMakeLists.txt` (después de `avformat`/`avcodec`/`avutil`/`swresample` -- importa el orden de
+  link).
+
+**Verificación real (no solo análisis estático):** se corrió un build completo en un directorio de
+prueba contra el VITASDK real del usuario: `cmake` configuró sin errores, `make -j4` compiló TODO
+el código fuente sin errores (incluyendo `video.cpp`, el punto de falla original), y el link
+completó exitosamente -> `asphalt5.velf` -> `eboot.bin` (SELF) -> `param.sfo` -> `asphalt5.vpk`
+(1.9MB). Esto resuelve dos de las incertidumbres "sin verificar" de la entrada anterior:
+- El paquete `ffmpeg` de vita-portlibs instalado SÍ tiene `ff_mpeg4_decoder` y `ff_aac_decoder`
+  presentes en `libavcodec.a` (confirmado con `nm`) -- los decoders que este juego necesita están
+  habilitados.
+- La versión de FFmpeg instalada es `LIBAVUTIL_VERSION_MAJOR=60` (API moderna,
+  `AVChannelLayout`/sin `av_register_all()`), coincide con la rama `#if LIBAVUTIL_VERSION_MAJOR >=
+  57` del código -- se confirmó cuál rama compila.
+
+**Sigue sin verificar en hardware:** que la reproducción de video/audio con decode por software
+funcione correctamente (visual y auditivamente) y a un framerate usable -- el build exitoso
+confirma que compila y linkea, no que funcione en consola real. Falta probar en consola y revisar
+el próximo log.
+
+**Nota para quien reproduzca este build:** si el entorno de build del toolkit no comparte el mismo
+`$VITASDK` que se usó para verificar (`vdpm ffmpeg` y `vdpm lame` se instalaron ahí directamente),
+hay que correr esos dos comandos `vdpm` también ahí antes de compilar.

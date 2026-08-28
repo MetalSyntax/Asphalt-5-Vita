@@ -55,10 +55,13 @@ Puntos de entrada que usa el arranque (offsets en el .so, base `0x98000000`):
 - [x] Análisis del motor real (ciclo de vida nativo, reuso de otro port o boilerplate genérico).
 - [x] Bootstrap del loader: so_file_load/so_relocate/so_resolve, primer build.
 - [x] Tabla JNI (FalsoJNI): registrar exports + callbacks hacia "Java".
-- [~] Primer arranque en consola real (bug #1 `mEnv==NULL` corregido; pendiente validar en hardware).
-- [ ] Gráficos (wrappers GL según versión detectada).
-- [ ] Input, Audio, Assets, LiveArea/VPK.
-- [ ] Pruebas en hardware real.
+- [x] Primer arranque en consola real (multiples bugs resueltos, juego arranca y no crashea).
+- [x] Gráficos (wrappers GLES 1.1 configurados, downsample FBO a 800x480 implementado para menús correctos y +26% rendimiento, bugs de corrupción de pantalla blanca resueltos).
+- [x] Input (Touch + tecla Círculo=Atrás en input.c).
+- [x] Audio (sceAudioOut, Ogg/Vorbis decoding en hilo secundario).
+- [x] Assets (jni_resloader lee de UX0 con LRU de 8 handles para evitar stutters).
+- [~] Video (Trailer de gameloft hace skip instantáneo de forma estable para entrar al juego sin trabar el UI; decodificación h264 pendiente).
+- [~] Pruebas en hardware real (juego jugable en progreso, rendimiento in-game estabilizado).
 
 ## 5. Herramientas
 

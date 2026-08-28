@@ -55,3 +55,4 @@ __pycache__/
 *.swp
 cmake-build-*/
 asphalt5/
+source_with_videosource_with_video/
