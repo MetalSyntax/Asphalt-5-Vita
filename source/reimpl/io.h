@@ -88,6 +88,12 @@ int fclose_soloader(FILE *f);
 
 int closedir_soloader(DIR *dir);
 
+size_t fwrite_soloader(const void * ptr, size_t size, size_t count, FILE * stream);
+size_t fread_soloader(void * ptr, size_t size, size_t count, FILE * stream);
+long ftell_soloader(FILE * stream);
+int fseek_soloader(FILE * stream, long offset, int whence);
+int fflush_soloader(FILE * stream);
+
 int fcntl_soloader(int fd, int cmd, ...);
 
 int ioctl_soloader(int fd, int request, ... /* arg */);

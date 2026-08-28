@@ -39,13 +39,7 @@ FILE * fopen_soloader(const char * filename, const char * mode) {
 
     if (strstr(filename, "replay.sav") != NULL) {
         l_info("BLOCKING replay.sav to save FPS!");
-        // We can't just return NULL because Gameloft might crash if they don't check.
-        // Instead, we open /dev/null using Vita's "null:" device, or just a dummy memory file.
-        // But Vita SDK doesn't have a standard /dev/null. We can use a temporary file or just a string stream.
-        // Actually, if we open it for writing and return it, but intercept fwrite?
-        // No, standard fopen/fwrite are not fully intercepted here.
-        // Let's just return NULL. Most engines handle replay file failure safely.
-        return NULL;
+        return (FILE *)0xDEADBEEF;
     }
 
     const char* target_filename = filename;
@@ -139,6 +133,9 @@ int stat_soloader(const char * path, stat64_bionic * buf) {
 }
 
 int fclose_soloader(FILE * f) {
+    if (f == (FILE *)0xDEADBEEF) {
+        return 0;
+    }
 #ifdef USE_SCELIBC_IO
     int ret = sceLibcBridge_fclose(f);
 #else
@@ -217,6 +214,60 @@ int fcntl_soloader(int fd, int cmd, ...) {
 int ioctl_soloader(int fd, int request, ...) {
     l_warn("ioctl(%i, %i, ...): not implemented", fd, request);
     return 0;
+}
+
+#define DUMMY_FILE_PTR ((FILE *)0xDEADBEEF)
+
+size_t fwrite_soloader(const void * ptr, size_t size, size_t count, FILE * stream) {
+    if (stream == DUMMY_FILE_PTR) {
+        return count; // Pretend we wrote it all successfully
+    }
+#ifdef USE_SCELIBC_IO
+    return sceLibcBridge_fwrite(ptr, size, count, stream);
+#else
+    return fwrite(ptr, size, count, stream);
+#endif
+}
+
+size_t fread_soloader(void * ptr, size_t size, size_t count, FILE * stream) {
+    if (stream == DUMMY_FILE_PTR) {
+        return 0; // EOF
+    }
+#ifdef USE_SCELIBC_IO
+    return sceLibcBridge_fread(ptr, size, count, stream);
+#else
+    return fread(ptr, size, count, stream);
+#endif
+}
+
+long ftell_soloader(FILE * stream) {
+    if (stream == DUMMY_FILE_PTR) {
+        return 0;
+    }
+#ifdef USE_SCELIBC_IO
+    return sceLibcBridge_ftell(stream);
+#else
+    return ftell(stream);
+#endif
+}
+
+int fseek_soloader(FILE * stream, long offset, int whence) {
+    if (stream == DUMMY_FILE_PTR) {
+        return 0;
+    }
+#ifdef USE_SCELIBC_IO
+    return sceLibcBridge_fseek(stream, offset, whence);
+#else
+    return fseek(stream, offset, whence);
+#endif
+}
+
+int fflush_soloader(FILE * stream) {
+    if (stream == DUMMY_FILE_PTR) {
+        return 0;
+    }
+    // Vita SDK doesn't always have a bridge for fflush. We can just use standard fflush.
+    return fflush(stream);
 }
 
 int fsync_soloader(int fd) {
