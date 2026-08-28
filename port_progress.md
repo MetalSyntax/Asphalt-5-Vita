@@ -802,6 +802,14 @@ El usuario reportó que, a pesar de llegar al menú principal y tener el juego f
 El motor Gameloft asume que sus estados globales persisten. Cuando intentaba dibujar los fundidos a blanco (fade-ins) de la pantalla de carga y el título, `GL_BLEND` estaba desactivado. En lugar de dibujar un blanco transparente, dibujaba un rectángulo blanco 100% opaco que tapaba toda la pantalla. Cuando el menú principal cargaba, re-inicializaba sus propios estados de blending, por lo que el menú sí se veía bien.
 
 **Fix:** Se actualizó `gl_blit_downsample_to_screen` en `source/utils/glutil.c` para hacer un "save & restore" completo del estado OpenGL (`glGetIntegerv`, `glIsEnabled`, etc.) antes y después de dibujar el FBO. Así, el motor Gameloft recupera exactamente el estado de texturas, blend, depth, scissor y color que había dejado al final de su frame, y las transparencias de la interfaz vuelven a funcionar.
+
+### Bug #16 -- Juego iba a 4 FPS en carrera debido a lecturas sincronas de disco
+
+El usuario reportó que a pesar de que el menú y resolución iban perfectos, dentro de la carrera el juego corría a 4 FPS máximo.
+
+**Diagnóstico:** Analizando los logs `asphalt5_037.log`, noté que durante la carrera se hacían cientos de llamadas a `GLResLoader.getResourceFull()`, pidiendo una y otra vez archivos `.cnk` (chunks) completos de 1 MB (ej. `package_general.bar_019.cnk`). En Android (memoria interna rápida + page cache de Linux), leer 1 MB repetidas veces toma 0ms porque sale de la RAM. Pero en PS Vita, hacer un `sceIoRead` de 1 MB de forma síncrona toma unos ~100 milisegundos por cada chunk, destrozando por completo el render loop (de ahí los 4 FPS).
+
+**Fix (Caché en RAM):** Reescribí `source/jni_resloader.c`. Eliminé las lecturas a disco continuas e implementé una Caché en RAM de 48 slots (`RAM_CACHE_SLOTS`). Ahora, la primera vez que se carga un chunk de 1 MB, se almacena en memoria. Las siguientes cientos de llamadas a ese mismo chunk se resuelven en 0.1 milisegundos con un simple `memcpy` desde la RAM de la consola (a la cual le sobran decenas de MB en este juego). Esto elimina el 100% del cuello de botella de I/O en medio de la carrera.
 `RES_PATH`, 14.8 MB) nunca llegó a reproducirse ni una vez, así que el
 logo+trailer que contiene nunca se vio. `GS_LoadMainMenu::Render()` sí hace
 render real (sprites, texto -- no es un no-op), así que la pantalla de

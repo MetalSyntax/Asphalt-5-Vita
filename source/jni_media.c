@@ -25,6 +25,8 @@ static const char * jstring_to_cstr(jobject jstr) {
     return (const char *) js->utf8->array;
 }
 
+#include "video.h"
+
 void impl_GLMediaPlayer_loadMovie(jmethodID id, va_list args) {
     const char *name = jstring_to_cstr((jobject) va_arg(args, jobject));
 
@@ -32,7 +34,11 @@ void impl_GLMediaPlayer_loadMovie(jmethodID id, va_list args) {
         s_game_slot = (uintptr_t *) so_symbol(&so_mod, "g_pMainGameClass");
 
     if (name && strlen(name) > 0) {
-        l_info("[movie] GLMediaPlayer.loadMovie(%s): scheduling instant skip", name);
+        l_info("[movie] GLMediaPlayer.loadMovie(%s): starting playback via software decode", name);
+        video_play(name);
+        l_info("[movie] GLMediaPlayer.loadMovie(%s): video_play returned", name);
+    } else {
+        l_warn("[movie] GLMediaPlayer.loadMovie: null/empty name");
     }
 
     // Tell media_pump to clear the flag on the NEXT frame, 

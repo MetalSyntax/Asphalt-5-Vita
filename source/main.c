@@ -3,6 +3,7 @@
 #include "utils/logger.h"
 #include "jni_resloader.h"
 #include "jni_media.h"
+#include "video.h"
 #include "input.h"
 #include "audio.h"
 
@@ -101,6 +102,7 @@ int main() {
     l_success("OpenGL initialized.");
 
     audio_init();
+    video_init();
 
     fn_getjnienv     nativeGetJNIEnv       = resolve("Java_com_gameloft_android_GAND_GloftA5HD_Asphalt5Renderer_nativeGetJNIEnv");
     fn_sub_init      GLResLoader_init      = resolve("Java_com_gameloft_android_GAND_GloftA5HD_GLResLoader_nativeInit");
