@@ -435,8 +435,8 @@ void audio_init(void) {
     }
 
     gQuit = 0;
-    // Pin the audio mixer to Core 1 (mask 0x02) to avoid stealing cycles from the main render thread
-    gThread = sceKernelCreateThread("audio_mixer", mixer_thread, 0x10000100, 0x10000, 0, 0x02, NULL);
+    // Pin the audio mixer to Core 1 (mask 0x20000) to avoid stealing cycles from the main render thread
+    gThread = sceKernelCreateThread("audio_mixer", mixer_thread, 0x10000100, 0x10000, 0, 0x20000, NULL);
     if (gThread < 0) {
         l_error("[audio] mixer thread creation failed (0x%08X)", (unsigned) gThread);
         sceAudioOutReleasePort(gPort);
@@ -447,9 +447,9 @@ void audio_init(void) {
 
     gLoadQueueHead = gLoadQueueTail = gLoadQueueCount = 0;
     gLoaderQuit = 0;
-    // Pin the heavy Vorbis loader thread to Core 2 (mask 0x04) with lowest priority (0x7F)
+    // Pin the heavy Vorbis loader thread to Core 2 (mask 0x40000) with lowest priority (0x7F)
     // so its software decoding doesn't stutter the game even slightly.
-    gLoaderThread = sceKernelCreateThread("audio_loader", loader_thread, 0x7F, 0x10000, 0, 0x04, NULL);
+    gLoaderThread = sceKernelCreateThread("audio_loader", loader_thread, 0x7F, 0x10000, 0, 0x40000, NULL);
     if (gLoaderThread < 0) {
         // Not fatal -- playback still works for anything already cached (nothing,
         // this early), it just means sfx_get() will queue requests that never
