@@ -435,8 +435,9 @@ void audio_init(void) {
     }
 
     gQuit = 0;
-    // Pin the audio mixer to Core 1 (mask 0x20000) to avoid stealing cycles from the main render thread
-    gThread = sceKernelCreateThread("audio_mixer", mixer_thread, 0x10000100, 0x10000, 0, 0x20000, NULL);
+    // Pin the audio mixer to Core 1 (mask 0x20000) to avoid stealing cycles from the main render thread.
+    // Use priority 0x40 (highest normal priority) to prevent audio stuttering (buffer underruns).
+    gThread = sceKernelCreateThread("audio_mixer", mixer_thread, 0x40, 0x10000, 0, 0x20000, NULL);
     if (gThread < 0) {
         l_error("[audio] mixer thread creation failed (0x%08X)", (unsigned) gThread);
         sceAudioOutReleasePort(gPort);

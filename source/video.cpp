@@ -822,7 +822,7 @@ void video_play(const char *name) {
                                     gCutAudioLen[1] = 0;
                                     gCutAudioQuit = false;
                                     cutAudioThreadUid = sceKernelCreateThread("cutscene audio out", cutscene_audio_thread,
-                                                                               0x10000100, 0x4000, 0, 0x40000, NULL);
+                                                                               0x40, 0x4000, 0, 0x40000, NULL);
                                     if (cutAudioThreadUid >= 0) {
                                         sceKernelStartThread(cutAudioThreadUid, 0, NULL);
                                     } else {

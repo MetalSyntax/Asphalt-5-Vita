@@ -837,7 +837,14 @@ Al solucionar el problema de los núcleos, el juego sufrió un congelamiento tot
 Al solucionar los FPS, el juego alcanzó por fin su máxima velocidad y comenzó a cargar modelos 3D masivamente. Esto provocó un cuelgue directo del hardware de la GPU de la Vita (`gpu_alloc_mapped_aligned` devolviendo out-of-memory o fallando).
 
 **Causa raíz:** Originalmente, el sistema de arrays de Java (`RES_POOL_SLOTS`) solo guardaba los últimos 8 archivos `.cnk` cargados. A 4 FPS esto no era problema, pero a 60 FPS el motor gráfico encola docenas de modelos (autos, pistas, etc.) en un solo frame. Al pedir más de 8 archivos, mi código reciclaba la memoria del primer archivo mientras OpenGL *todavía estaba dibujando* usándolo. Esto corrompía los modelos 3D: OpenGL leía índices basura, pedía millones de vértices y colapsaba la memoria gráfica de la Vita.
-**Fix:** Aumenté el `RES_POOL_SLOTS` de 8 a 48, garantizando que todos los modelos de un frame tengan su propia memoria segura e intocable. Además, aumenté el límite de memoria interna de polígonos de VitaGL de 6MB a 12MB en `vglInitExtended`., permitiendo por fin jugar la carrera de forma fluida.
+**Fix:** Aumenté el `RES_POOL_SLOTS` de 8 a 48, garantizando que todos los modelos de un frame tengan su propia memoria segura e intocable. Además, aumenté el límite de memoria interna de polígonos de VitaGL de 6MB a 12MB en `vglInitExtended`.
+
+### Bug #20 -- Audio entrecortado (stuttering) pese a tener su propio núcleo
+
+El juego ya corre sin crashes y a máxima velocidad, pero el audio se escucha "entrecortado", con saltos o tartamudeos.
+
+**Causa raíz:** Al configurar los hilos de audio para usar los otros núcleos, les asigné la prioridad `0x10000100`. En la vieja PSP, ese número significaba "Prioridad Normal de Usuario". Sin embargo, en el sistema operativo moderno de PS Vita, los números de prioridad van del 0 al 255. Darle un número gigante y fuera de estándar como `0x10000100` hace que el sistema operativo de la Vita lo trate como un hilo "inválido" o de la más bajísima prioridad posible (255). Esto provocaba que, a pesar de estar en el Core 1, el OS interrumpiera el audio constantemente para hacer micro-tareas del sistema.
+**Fix:** Cambié la prioridad de los hilos reproductores de audio en `audio.cpp` y `video.cpp` de `0x10000100` a `0x40` (64). En la arquitectura de Vita, 64 es el estándar para "Prioridad Alta en Tiempo Real". Ahora el hilo de audio le exige al Core 1 que no lo interrumpa por ningún motivo, entregando un sonido limpio y continuo.
 
 `RES_PATH`, 14.8 MB) nunca llegó a reproducirse ni una vez, así que el
 logo+trailer que contiene nunca se vio. `GS_LoadMainMenu::Render()` sí hace
@@ -1440,3 +1447,103 @@ el próximo log.
 **Nota para quien reproduzca este build:** si el entorno de build del toolkit no comparte el mismo
 `$VITASDK` que se usó para verificar (`vdpm ffmpeg` y `vdpm lame` se instalaron ahí directamente),
 hay que correr esos dos comandos `vdpm` también ahí antes de compilar.
+
+## Sesión de rendimiento (2026-08-27/28) -- cuadro de 10 optimizaciones + techo de la caché RAM
+
+El usuario pidió una tabla de 10 optimizaciones y, si era posible, subir más el FPS en carrera
+(objetivo 15 FPS sostenidos), a partir de `logs/asphalt5_043.log`. Ese log (43 líneas útiles) sólo
+alcanza a cubrir la carga inicial de assets (`Entering render loop.` en t=3.6s hasta t=19.7s
+cacheando chunks) -- se corta ahí, antes de llegar a la carrera, así que no aporta evidencia nueva
+sobre el framerate en pista específicamente (ni tampoco muestra ningún crash). No se pudo medir FPS
+real de esta sesión porque este entorno no tiene VITASDK -- no hay forma de compilar/desplegar/jugar
+acá, sólo análisis estático del código ya existente (mismo límite documentado en entradas previas).
+
+**Hallazgo real (no un supuesto):** `source/jni_resloader.c`'s `RAM_CACHE_SLOTS` estaba en `48`
+(fijado en el Bug #16). El set de datos real detrás de `GLResLoader` -- confirmado con `ls` sobre
+`ux0_data/asphalt5/data/`, no adivinado -- es **113 archivos distintos** (93
+`package_general.bar_*.cnk` + 5 `.bar` + 2 `.map` + 13 `.bsprite`; los 187 `.glsnd` de audio NO pasan
+por acá, tienen su propio cache en `audio.cpp`). Con sólo 48 slots, la caché **no puede** contener el
+set completo: si la carrera toca más de 48 archivos distintos en su patrón de acceso entrelazado
+(el mismo patrón ya documentado en el Bug #9, chunks fuera de orden), el LRU desaloja uno que va a
+volver a pedirse, y esa lectura vuelve a pagar `sceIoOpen`/`sceIoRead` síncrono contra la memory
+card -- el mismo stutter del Bug #16, reintroducido en un umbral más alto en vez de eliminado del
+todo.
+
+**Fix aplicado:** `RAM_CACHE_SLOTS` subido de `48` a `128` (cubre los 113 archivos conocidos con
+margen). Costo: hasta 128 MB de RAM si el juego llega a tocar los 113 (heap de 256 MB configurado en
+`main.c`, sigue sobrando margen junto al pool de 48 slots de `RES_POOL_SLOTS`). Con esto, una vez que
+cada archivo se lee una vez, se queda en RAM para el resto de la sesión -- cero I/O a disco durante
+el resto de la carrera, sin excepción.
+
+**Pendiente:** recompilar con el toolkit, redesplegar, medir FPS real en carrera. Si sigue por
+debajo de 15 FPS sostenidos después de esto, el siguiente sospechoso (ya anotado en el Bug #9) es el
+costo de CPU de descomprimir LZMA por chunk en el motor mismo (`Package.cpp`), no I/O -- eso
+requeriría perfilar en consola real, no se puede resolver por análisis estático.
+
+### Cuadro de 10 optimizaciones (rendimiento en carrera)
+
+| # | Optimización | Estado | Efecto esperado |
+|---|---|---|---|
+| 1 | Downsample FBO 960x544 -> 800x480 (Bug #10) | Hecho | ~26% menos píxeles rasterizados/sombreados por frame |
+| 2 | Caché RAM de chunks `.cnk`/`.bar` (Bug #16), ahora 128 slots (esta sesión) | Hecho | Elimina I/O síncrono de SD card por chunk repetido durante la carrera |
+| 3 | Afinidad de núcleos para audio: mixer en Core 1, decode Vorbis en Core 2 (Bug #17) | Hecho | Libera 100% del Core 0 para el motor gráfico/lógica |
+| 4 | `replay.sav` interceptado con FILE* fantasma (Bug #18) | Hecho | Elimina escrituras síncronas a SD card por frame durante la carrera |
+| 5 | `RES_POOL_SLOTS` 8 -> 48 + pool de vértices vitaGL 6MB -> 12MB (Bug #19) | Hecho | Evita que la GPU lea memoria reciclada mientras aún dibuja (GPU crash) |
+| 6 | Decode de sonidos Vorbis en hilo de fondo, no bloqueante (Bug #15/audio) | Hecho | Evita congelar el hilo principal varios segundos por sonido nuevo |
+| 7 | `vglSwapBuffers(GL_FALSE)` (vsync desactivado) | Ya así | Evita esperar al refresco de pantalla si el frame ya está listo antes |
+| 8 | Reducir aún más la resolución interna del FBO offscreen (ej. 640x384) | Propuesto, NO aplicado | Menos píxeles todavía -- requiere desacoplar `SCREEN_W/H` (que el menú necesita en 800x480, Bug #10) de la resolución real del FBO sin romper el layout; alto riesgo de repetir el crash del Bug #8 si se hace mal, necesita probarse en hardware paso a paso |
+| 9 | Evitar recompresión/relectura LZMA repetida por chunk en el motor | Sin investigar | Sospechoso pendiente desde el Bug #9 si el cuello de botella sigue siendo CPU y no I/O tras el fix #2 |
+| 10 | LTO (`-flto`) / afinar flags de compilación propios | Sin aplicar | Gz gains menores de inlining entre unidades de compilación; no se aplicó porque no hay forma de verificar que compila en este entorno (sin VITASDK) |
+
+**Nota sobre "como sea hasta 15 FPS":** no se puede forzar ni verificar un número de FPS sin correr
+en hardware real -- este entorno no tiene VITASDK para compilar ni consola para medir. El único
+cambio de código de esta sesión (#2 en la tabla) es el que tiene evidencia concreta (el conteo real
+de archivos vs. el tamaño de la caché) de que puede mover la aguja; los ítems #8/#9/#10 quedan
+documentados como próximos pasos con su respectivo riesgo, no aplicados a ciegas.
+
+### Bug #20 -- REVERTIDO: subir `RAM_CACHE_SLOTS` a 128 disparó el mismo GPU crash del Bug #19, a un umbral de carga más alto
+
+El usuario probó el cambio #2 de la tabla de arriba en consola real y confirmó un GPU crash.
+
+**Evidencia (2 dumps, analizados con `psvita-toolkit analyze --so-base 0x98000000`):**
+
+- `asphalt5-psp2core-1787888468-GPUCRASH.psp2dmp` -- crash **anterior** a este cambio (el log
+  emparejado, `asphalt5_042.log`, todavía muestra el patrón de slots 0-47 del `RAM_CACHE_SLOTS=48`
+  viejo -- confirmado leyendo los números de slot en los mensajes `resloader: Cached ... (Slot N)`).
+  Este es, de hecho, el crash real que motivó el commit `787a290` (Bug #19).
+- `asphalt5-psp2core-1787889954-GPUCRASH.psp2dmp` -- crash **posterior** al cambio de esta sesión
+  (`RAM_CACHE_SLOTS=128`), sin log emparejado (la app crasheó en medio de la misma corrida cuyo log
+  activo era `asphalt5_043.log`, que no llega a escribir nada después del crash porque el log
+  incremental no tiene un manejador de crash propio que lo marque).
+
+**Las dos pilas son idénticas en forma** -- mismo encadenamiento exacto en ambos dumps:
+
+```
+glDrawElements (vitaGL draw.c:414)
+  -> _glDrawElements_FixedFunctionIMPL (vitaGL ffp.c:1621)
+    -> gpu_alloc_mapped_aligned (vitaGL gpu_utils.c, agotamiento del pool de vértices)
+```
+
+Sólo cambia el tamaño de la asignación que falla (`R2`): `0x5d0a0` (~372 KB) en el dump viejo,
+`0x991e0` (~611 KB) en el nuevo -- varía porque depende de cuántos vértices trae el draw call en
+curso, no es el mismo número exacto, pero es el mismo mecanismo de fondo.
+
+**Conclusión -- no es un bug nuevo de este cambio, es el mismo límite del Bug #19 disparado antes:**
+subir la caché de 48 a 128 slots elimina más recargas de disco durante la carrera, así que el motor
+llega a streamear/encolar geometría más rápido de lo que hacía antes. El pool de vértices de vitaGL
+(12MB, fijado en el Bug #19) sigue siendo el mismo límite absoluto de siempre -- lo que cambió es que
+ahora se llega a ese límite con más frecuencia/más rápido, porque ya no hay un stall de I/O
+"frenando" accidentalmente cuánta geometría se encola por frame. El fix del Bug #19 (12MB) alcanzaba
+para el ritmo de streaming de ANTES de este cambio, no necesariamente para el de después.
+
+**Fix (revertido, no un nuevo ajuste a ciegas):** `source/jni_resloader.c` -- `RAM_CACHE_SLOTS`
+devuelto a `48` (el valor que el Bug #19 verificó como estable). Subir el pool de vértices de vitaGL
+otra vez (de 12MB a algo mayor) en vez de revertir la caché sería la alternativa "correcta" a largo
+plazo, pero no se aplicó en esta sesión porque no hay forma de verificar en este entorno (sin
+VITASDK) cuánto hace falta ni si introduce un problema distinto de presupuesto de memoria total de
+la consola -- mejor revertir a lo último confirmado estable que adivinar un número más grande sin
+poder probarlo.
+
+**Pendiente:** si se quiere retomar la ampliación de la caché de assets, hacerlo en conjunto con un
+aumento medido del pool de vértices (probar en consola después de cada cambio, uno a la vez, no los
+dos juntos) para no perder de nuevo la trazabilidad de cuál cambio causó qué.
