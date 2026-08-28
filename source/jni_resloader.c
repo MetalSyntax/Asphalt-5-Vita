@@ -15,7 +15,7 @@
 #define RES_PATH DATA_PATH "data/"
 
 // --- JDA Pool (For returning byte arrays to the engine) ---
-#define RES_POOL_SLOTS 8
+#define RES_POOL_SLOTS 48
 typedef struct {
     JavaDynArray * jda;
     jsize          cap;

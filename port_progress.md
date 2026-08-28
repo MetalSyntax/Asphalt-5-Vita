@@ -830,7 +830,15 @@ Al solucionar el problema de los núcleos, el juego sufrió un congelamiento tot
 **Fix 1:** Se revirtió el uso de punteros directos. El `memcpy` de 1MB por frame es absolutamente obligatorio para proteger la caché de las modificaciones del motor.
 
 **Causa raíz 2 (1 FPS en carrera):** Al revisar detalladamente el log `asphalt5_040.log`, me di cuenta de una pausa asombrosa de más de 1 segundo causada por el archivo `replay.sav`. El motor de Gameloft estaba abriendo este archivo para grabar un "replay" de la carrera, haciendo escrituras síncronas (`fwrite`) a la tarjeta SD en cada frame. La tarjeta SD (SD2Vita) no soporta bien escrituras de pocos bytes por frame, colapsando el rendimiento a 1 FPS.
-**Fix 2:** En `source/reimpl/io.c`, intercepté `fopen_soloader` y `open_soloader` para **bloquear intencionalmente** la creación de `replay.sav` (devolviendo `NULL` o `-1`). Al engañar al juego para que no grabe replays, eliminamos el 100% de la carga de escritura en el disco, permitiendo por fin jugar la carrera de forma fluida.
+**Fix 2:** En `source/reimpl/io.c`, intercepté `fopen_soloader`, `fwrite_soloader` y todas las llamadas relativas para usar un puntero a un archivo fantasma (`0xDEADBEEF`). Al engañar al juego para que grabe exitosamente los replays en la nada misma, eliminamos el 100% de la carga de escritura en el disco sin crashear los sistemas de usuario.
+
+### Bug #19 -- GPU Crash (`gpu_alloc_mapped_aligned`) al entrar a la pista
+
+Al solucionar los FPS, el juego alcanzó por fin su máxima velocidad y comenzó a cargar modelos 3D masivamente. Esto provocó un cuelgue directo del hardware de la GPU de la Vita (`gpu_alloc_mapped_aligned` devolviendo out-of-memory o fallando).
+
+**Causa raíz:** Originalmente, el sistema de arrays de Java (`RES_POOL_SLOTS`) solo guardaba los últimos 8 archivos `.cnk` cargados. A 4 FPS esto no era problema, pero a 60 FPS el motor gráfico encola docenas de modelos (autos, pistas, etc.) en un solo frame. Al pedir más de 8 archivos, mi código reciclaba la memoria del primer archivo mientras OpenGL *todavía estaba dibujando* usándolo. Esto corrompía los modelos 3D: OpenGL leía índices basura, pedía millones de vértices y colapsaba la memoria gráfica de la Vita.
+**Fix:** Aumenté el `RES_POOL_SLOTS` de 8 a 48, garantizando que todos los modelos de un frame tengan su propia memoria segura e intocable. Además, aumenté el límite de memoria interna de polígonos de VitaGL de 6MB a 12MB en `vglInitExtended`., permitiendo por fin jugar la carrera de forma fluida.
+
 `RES_PATH`, 14.8 MB) nunca llegó a reproducirse ni una vez, así que el
 logo+trailer que contiene nunca se vio. `GS_LoadMainMenu::Render()` sí hace
 render real (sprites, texto -- no es un no-op), así que la pantalla de

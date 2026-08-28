@@ -110,7 +110,8 @@ static void gl_init_downsample() {
 }
 
 void gl_init() {
-    vglInitExtended(0, 960, 544, 6 * 1024 * 1024, SCE_GXM_MULTISAMPLE_NONE);
+    // FalsoJNI might pass a lot of data, and 6MB might not be enough for Asphalt 5. Let's use 12MB.
+    vglInitExtended(0, 960, 544, 12 * 1024 * 1024, SCE_GXM_MULTISAMPLE_NONE);
     gl_init_downsample();
 }
 
