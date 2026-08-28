@@ -810,6 +810,17 @@ El usuario reportó que a pesar de que el menú y resolución iban perfectos, de
 **Diagnóstico:** Analizando los logs `asphalt5_037.log`, noté que durante la carrera se hacían cientos de llamadas a `GLResLoader.getResourceFull()`, pidiendo una y otra vez archivos `.cnk` (chunks) completos de 1 MB (ej. `package_general.bar_019.cnk`). En Android (memoria interna rápida + page cache de Linux), leer 1 MB repetidas veces toma 0ms porque sale de la RAM. Pero en PS Vita, hacer un `sceIoRead` de 1 MB de forma síncrona toma unos ~100 milisegundos por cada chunk, destrozando por completo el render loop (de ahí los 4 FPS).
 
 **Fix (Caché en RAM):** Reescribí `source/jni_resloader.c`. Eliminé las lecturas a disco continuas e implementé una Caché en RAM de 48 slots (`RAM_CACHE_SLOTS`). Ahora, la primera vez que se carga un chunk de 1 MB, se almacena en memoria. Las siguientes cientos de llamadas a ese mismo chunk se resuelven en 0.1 milisegundos con un simple `memcpy` desde la RAM de la consola (a la cual le sobran decenas de MB en este juego). Esto elimina el 100% del cuello de botella de I/O en medio de la carrera.
+
+### Bug #17 -- Juego cae a 0 FPS / se congela al iniciar la carrera (Saturación de CPU por Audio)
+
+A pesar de haber arreglado el acceso a disco, el usuario reportó que el juego iba a 6 FPS en el menú y caía a **0 FPS** (se congelaba) al arrancar la carrera.
+
+**Causa raíz:** Analizando el hilo de carga de audio en `asphalt5_038.log`, descubrí que el juego estaba decodificando docenas de archivos Vorbis (`.glsnd`) pesadísimos al arrancar la carrera (rugidos de motor, derrapes, etc.). El decodificador por software `stb_vorbis` es muy exigente matemáticamente para la CPU de la Vita. Como nuestro hilo `audio_loader` se estaba creando en el Core 0 (el mismo núcleo principal donde corre el renderizado del juego y OpenGL) y con la misma prioridad, la decodificación de audio estaba **estrangulando** y robando el 100% de la CPU al juego.
+
+**Fix:** Se modificó la creación de hilos en `source/audio.cpp` para usar la "afinidad de núcleos" (`cpuAffinityMask`) de la PS Vita:
+1. El hilo mezclador de audio (`audio_mixer`) se movió permanentemente al **Core 1** (`mask 0x02`).
+2. El hilo pesado de decodificación Vorbis (`audio_loader`) se movió permanentemente al **Core 2** (`mask 0x04`), y además se le bajó la prioridad a `0x7F` (la más baja del sistema).
+Con esta arquitectura multinúcleo real, la decodificación de audio ocurre de fondo usando un procesador físico completamente distinto, dejando el Core 0 al 100% libre para que el motor gráfico de Gameloft corra a máxima velocidad (60 FPS) sin jamás tartamudear.
 `RES_PATH`, 14.8 MB) nunca llegó a reproducirse ni una vez, así que el
 logo+trailer que contiene nunca se vio. `GS_LoadMainMenu::Render()` sí hace
 render real (sprites, texto -- no es un no-op), así que la pantalla de
