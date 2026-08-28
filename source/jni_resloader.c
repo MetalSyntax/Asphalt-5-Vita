@@ -136,21 +136,6 @@ void resloader_shutdown(void) {
     }
 }
 
-// --- No-copy JDA Pool (For returning cached data directly) ---
-static JavaDynArray _nocopy_pool[128];
-static int _nocopy_next = 0;
-
-static JavaDynArray * pool_take_nocopy(void * cached_data, jsize len) {
-    if (len <= 0) return NULL;
-    JavaDynArray * jda = &_nocopy_pool[_nocopy_next];
-    _nocopy_next = (_nocopy_next + 1) % 128;
-    
-    jda->array = cached_data;
-    jda->len = len;
-    jda->type = FIELD_TYPE_BYTE;
-    return jda;
-}
-
 jint impl_GLResLoader_getResourceLength(jmethodID id, va_list args) {
     jobject name = va_arg(args, jobject);
     char path[512];
@@ -174,15 +159,15 @@ jobject impl_GLResLoader_getResourceFull(jmethodID id, va_list args) {
     }
 
     jsize size = (jsize) st.st_size;
+    JavaDynArray * jda = pool_take(size);
+    if (!jda) return NULL;
 
     // Check RAM cache
     void * cached_data = rcache_get(path, size);
     if (cached_data) {
-        return (jobject) pool_take_nocopy(cached_data, size);
+        memcpy(jda->array, cached_data, size);
+        return (jobject) jda;
     }
-
-    JavaDynArray * jda = pool_take(size);
-    if (!jda) return NULL;
 
     SceUID fd = sceIoOpen(path, SCE_O_RDONLY, 0777);
     if (fd < 0) return NULL;

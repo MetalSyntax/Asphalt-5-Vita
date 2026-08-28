@@ -821,6 +821,16 @@ A pesar de haber arreglado el acceso a disco, el usuario reportó que el juego i
 1. El hilo mezclador de audio (`audio_mixer`) se movió permanentemente al **Core 1** (`mask 0x02`).
 2. El hilo pesado de decodificación Vorbis (`audio_loader`) se movió permanentemente al **Core 2** (`mask 0x04`), y además se le bajó la prioridad a `0x7F` (la más baja del sistema).
 Con esta arquitectura multinúcleo real, la decodificación de audio ocurre de fondo usando un procesador físico completamente distinto, dejando el Core 0 al 100% libre para que el motor gráfico de Gameloft corra a máxima velocidad (60 FPS) sin jamás tartamudear.
+
+### Bug #18 -- Congelamiento total de GPU (0 FPS / 0% CPU) y lag de 1 FPS por `replay.sav`
+
+Al solucionar el problema de los núcleos, el juego sufrió un congelamiento total (la CPU y GPU cayeron al 0%) y, antes de eso, el juego iba a 1 FPS.
+
+**Causa raíz 1 (GPU Hang):** Al intentar optimizar el uso de RAM eliminando el `memcpy` de los chunks (pasándole al motor un puntero directo a la Caché en vez de una copia), descubrí que el motor de Gameloft modifica los archivos `.cnk` "in-place" (desencripta u obfusca bytes en el mismo array). Al modificar directamente la caché, la corrompía para el siguiente frame, pasándole texturas y polígonos corruptos a OpenGL, lo que hacía que la GPU de la Vita colapsara (GPU Hang) e hiciera caer todo al 0%.
+**Fix 1:** Se revirtió el uso de punteros directos. El `memcpy` de 1MB por frame es absolutamente obligatorio para proteger la caché de las modificaciones del motor.
+
+**Causa raíz 2 (1 FPS en carrera):** Al revisar detalladamente el log `asphalt5_040.log`, me di cuenta de una pausa asombrosa de más de 1 segundo causada por el archivo `replay.sav`. El motor de Gameloft estaba abriendo este archivo para grabar un "replay" de la carrera, haciendo escrituras síncronas (`fwrite`) a la tarjeta SD en cada frame. La tarjeta SD (SD2Vita) no soporta bien escrituras de pocos bytes por frame, colapsando el rendimiento a 1 FPS.
+**Fix 2:** En `source/reimpl/io.c`, intercepté `fopen_soloader` y `open_soloader` para **bloquear intencionalmente** la creación de `replay.sav` (devolviendo `NULL` o `-1`). Al engañar al juego para que no grabe replays, eliminamos el 100% de la carga de escritura en el disco, permitiendo por fin jugar la carrera de forma fluida.
 `RES_PATH`, 14.8 MB) nunca llegó a reproducirse ni una vez, así que el
 logo+trailer que contiene nunca se vio. `GS_LoadMainMenu::Render()` sí hace
 render real (sprites, texto -- no es un no-op), así que la pantalla de

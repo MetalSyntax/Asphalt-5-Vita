@@ -37,6 +37,17 @@ FILE * fopen_soloader(const char * filename, const char * mode) {
         return fopen_soloader("app0:/meminfo", mode);
     }
 
+    if (strstr(filename, "replay.sav") != NULL) {
+        l_info("BLOCKING replay.sav to save FPS!");
+        // We can't just return NULL because Gameloft might crash if they don't check.
+        // Instead, we open /dev/null using Vita's "null:" device, or just a dummy memory file.
+        // But Vita SDK doesn't have a standard /dev/null. We can use a temporary file or just a string stream.
+        // Actually, if we open it for writing and return it, but intercept fwrite?
+        // No, standard fopen/fwrite are not fully intercepted here.
+        // Let's just return NULL. Most engines handle replay file failure safely.
+        return NULL;
+    }
+
     const char* target_filename = filename;
     char mapped_path[256];
     const char* prefix = "/data/data/com.gameloft.android.GAND.GloftA5HD/";
@@ -64,6 +75,11 @@ int open_soloader(const char * path, int oflag, ...) {
         return open_soloader("app0:/cpuinfo", oflag);
     } else if (strcmp(path, "/proc/meminfo") == 0) {
         return open_soloader("app0:/meminfo", oflag);
+    }
+
+    if (strstr(path, "replay.sav") != NULL) {
+        l_info("BLOCKING replay.sav in open to save FPS!");
+        return -1;
     }
 
     const char* target_path = path;
