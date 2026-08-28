@@ -1,0 +1,15 @@
+# UDP log sink (debugnet-compatible).
+#
+# Copy this file to ux0:data/asphalt5/netlog.txt on the Vita and set `ip` to
+# the machine that should receive the log. Delete the file to turn the sink
+# back off. No rebuild is needed either way.
+#
+# On the receiving machine:
+#   nc -u -l 18194        # macOS / BSD
+#   nc -u -l -p 18194     # Linux
+#
+# Format is `key value`, one per line. Only `ip` and `port` are recognised;
+# every other line -- these comments included -- is skipped.
+
+ip 192.168.3.10
+port 18194

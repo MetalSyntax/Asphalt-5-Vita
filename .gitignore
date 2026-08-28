@@ -1,0 +1,57 @@
+# macOS metadata
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+
+# Android APK/ZIP originales y extracción -- nunca commitear el juego (DMCA)
+*.apk
+*.zip
+/asphalt5_extract/
+
+# Java decompilado con jadx (derivado, regenerable: jadx -d decompiled/apk_jadx "Asphalt-5-HD-v3.4.1.apk")
+/decompiled/apk_jadx/
+
+# Pseudo-C decompilado del/los .so (derivado, regenerable con devrvk/so-decompiler)
+/decompiled/*/ghidra/
+
+# Librerías .so propietarias del juego original
+lib/*.so
+lib/**/*.so
+asphalt5_extract/lib/
+
+# Assets del juego montados para pruebas
+ux0_data/
+assets/
+
+# Build artifacts
+/build/
+CMakeCache.txt
+CMakeFiles/
+Makefile
+cmake_install.cmake
+*.elf
+*.self
+*.vpk
+*.suprx
+*.o
+compile_commands.json
+
+# Debugging en consola real
+/logs/
+log_*.txt
+*.psp2dmp
+
+# Python
+__pycache__/
+*.pyc
+
+# Config local del toolkit (contiene IP de tu Vita -- no es secreto pero es de tu red)
+.psvita-toolkit.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+cmake-build-*/
+asphalt5/
