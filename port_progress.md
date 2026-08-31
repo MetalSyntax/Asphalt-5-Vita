@@ -1902,3 +1902,40 @@ va a decir con certeza si es GPU-bound (VGLPOOL cayendo a 0 / FRAME alto con `Sc
 `RenderInterface` como última fase sin EXIT) o si el tiempo se va en otra fase (`Update`/`UpdateCars`).
 Una vez diagnosticado, apagar `ENABLE_PERF_TELEMETRY` (no dejarlo ON en un build final -- fuerza
 `sceGxmFinish` y repatchea código en cada frame instrumentado).
+
+### Mejora de Audio (2026-08-31) -- CONFIRMADO Y CORREGIDO: Audio entre cortado (stuttering) por soft-float
+
+El usuario reportó que el audio del port se escuchaba entre cortado.
+
+**Causa raíz:** `source/audio.cpp` usaba el tipo `double` en `struct Voice` para llevar la cuenta de la posición (`v->pos`) y el incremento (`v->step`) de cada pista al reproducirse (resampling) y hacía múltiples operaciones (suma, casteo a entero, e incluso `fmod()`) por cada *sample* de audio en el hilo de mezcla (`mixer_thread`). Dado que el procesador de Vita (Cortex A9) no tiene FPU de doble precisión (solo de precisión simple, VFPv3), toda operación con `double` invoca rutinas lentas emuladas por software (`__aeabi_dadd`, `__aeabi_dmul`). Al mezclar 17 voces con un bloque de 2048 muestras a 44.1kHz (miles de operaciones soft-float por ciclo), el hilo `audio_mixer` no lograba completar la mezcla a tiempo (buffer underrun), originando el audio entre cortado y ralentizando todo el juego. Además, `MIX_RATE` estaba en 44100Hz en lugar de la frecuencia nativa de 48000Hz.
+
+**Fix:**
+- Se migró el cálculo de posiciones y `step` de las pistas de `double` a un sistema de punto fijo de 32.32 bits con enteros sin signo (`pos_int`, `pos_frac`, `step_int`, `step_frac`). Esto asegura precisión perfecta a lo largo del tiempo (no se desincroniza al final del audio), sin la sobrecarga de punto flotante.
+- Se reemplazó el ineficiente `fmod` por un bucle `while (v->pos_int >= s->frames) v->pos_int -= s->frames;` en la rutina de loopeo.
+- Se cambió `MIX_RATE` a `48000` (el valor nativo para `SCE_AUDIO_OUT_PORT_TYPE_BGM` en Vita) y `MIX_GRAIN` a `1024` para que las actualizaciones fluyan mejor hacia el buffer del sistema.
+
+**Pendiente:** Compilar y desplegar a la consola para confirmar que el audio ahora se escucha perfectamente fluido durante todo el juego.
+
+### Mejora de Audio (2026-08-31, segunda parte) -- CORREGIDO: Audio distorsionado por clipping y aliasing
+
+Tras arreglar el "stuttering", el usuario indicó que el audio seguía distorsionado (ruido rasposo o metálico). 
+
+**Causa raíz:**
+1. **Aliasing por submuestreo:** El motor remuestreaba las pistas de 22kHz o 44.1kHz a los 48kHz nativos descartando o duplicando muestras directamente (nearest-neighbor), lo que causaba ruido armónico artificial (aliasing).
+2. **Clipping:** Cuando se reproducían muchos sonidos al mismo tiempo a volumen máximo, sus valores PCM se sumaban superando el límite de un entero de 16-bits (`> 32767`). El código hacía un límite "duro" (hard clamp), mutilando la onda de sonido y generando una distorsión extremadamente sucia y ruidosa.
+
+**Fix:**
+- Se implementó **Interpolación Lineal** en `mix_voice` usando la fracción (`v->pos_frac`) residual del punto fijo para mezclar suavemente la muestra actual y la siguiente. Esto suaviza drásticamente el cambio de frecuencia y elimina la distorsión por "crunch" del resampler.
+- Se añadió una atenuación maestra del 70% (`* 180 / 256`) a la mezcla final justo antes de enviarla a los audífonos, proveyendo un _headroom_ (margen dinámico) suficiente para que múltiples sonidos estallen juntos (choques, derrapes, música) sin cruzar el límite de `32767`.
+
+### Mejora de Audio (2026-08-31, tercera parte) -- CORREGIDO: Ruido metálico por superposición y control de volumen
+
+A pesar de los arreglos anteriores, la distorsión persistía. Una revisión exhaustiva del comportamiento del motor original reveló las siguientes causas definitivas:
+
+**Causa raíz:**
+1. **Falta de Pitch (`setPitch` inactivo):** La función JNI `GLMediaPlayer_setPitch` estaba completamente vacía (un "stub"). En los juegos de carreras como Asphalt, el motor de audio reproduce exactamente el mismo _sample_ del motor de un auto múltiples veces pero cambiando su tono/velocidad (pitch) para simular las RPM y las distintas distancias de los autos rivales. Al ignorar los cambios de pitch, todos los motores de los autos en pantalla sonaban **exactamente a la misma frecuencia**, generando un solapamiento destructivo conocido como _phasing_ o filtro de peine (comb filtering), lo que el usuario percibía como un "audio metálico súper distorsionado".
+2. **Volumen del motor no acotado:** La función `setVolume` de la API de Gameloft estaba recibiendo ocasionalmente niveles de volumen por encima del normal (e.g. `2.0` o valores no procesados), lo que el código en `audio.cpp` aceptaba ciegamente, causando una sobresaturación astronómica del acumulador y destrozando la curva de sonido.
+
+**Fix:**
+- Se implementó completamente `GLMediaPlayer_setPitch`, agregando un multiplicador flotante `pitch` a `struct Voice`. Ahora, cuando el juego altera el pitch del sonido, se vuelve a calcular matemáticamente el avance fraccional (`step_int` / `step_frac`), permitiendo que el resampler mueva el audio más lento o rápido fluidamente. Esto soluciona los problemas de flanger/phasing.
+- Se agregó el código de seguridad (clamping) necesario a `GLMediaPlayer_setVolume` y `GLMediaPlayer_setVolumeBig` limitando tajantemente las entradas de volumen entre `0.0f` y `1.0f`.

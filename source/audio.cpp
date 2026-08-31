@@ -21,8 +21,8 @@
 #include <string.h>
 #include <math.h>
 
-#define MIX_RATE   44100
-#define MIX_GRAIN  2048
+#define MIX_RATE   48000
+#define MIX_GRAIN  1024
 #define MAX_VOICES 16
 
 // libasphalt5.so's Java_..._GLMediaPlayer_nativeGetTotalSounds() returns
@@ -39,8 +39,11 @@ struct SfxSample {
 
 struct Voice {
     SfxSample *smp;
-    double pos;
-    double step;
+    unsigned int pos_int;
+    unsigned int pos_frac;
+    unsigned int step_int;
+    unsigned int step_frac;
+    float pitch;
     float gain;
     float targetGain;
     int fadeFramesLeft;
@@ -351,28 +354,50 @@ static void mix_voice(Voice *v, int *accL, int *accR, int frames) {
             if (v->fadeFramesLeft == 0) v->gain = v->targetGain;
         }
 
-        unsigned f = (unsigned) v->pos;
-        if (f >= s->frames) {
+        unsigned f0 = v->pos_int;
+        if (f0 >= s->frames) {
             if (v->loop && s->frames > 0) {
-                v->pos = fmod(v->pos, (double) s->frames);
-                f = (unsigned) v->pos;
+                while (v->pos_int >= s->frames) {
+                    v->pos_int -= s->frames;
+                }
+                f0 = v->pos_int;
             } else {
                 v->smp = NULL;
                 break;
             }
         }
 
-        short sl, sr;
-        if (s->channels == 1) {
-            sl = sr = s->pcm[f];
-        } else {
-            sl = s->pcm[f * 2];
-            sr = s->pcm[f * 2 + 1];
+        unsigned f1 = f0 + 1;
+        if (f1 >= s->frames) {
+            f1 = (v->loop) ? 0 : f0; // Loop around, or clamp to last frame
         }
+
+        int frac = v->pos_frac >> 24; // 8-bit fraction for interpolation (0-255)
+
+        int sl0, sr0, sl1, sr1;
+        if (s->channels == 1) {
+            sl0 = sr0 = s->pcm[f0];
+            sl1 = sr1 = s->pcm[f1];
+        } else {
+            sl0 = s->pcm[f0 * 2];
+            sr0 = s->pcm[f0 * 2 + 1];
+            sl1 = s->pcm[f1 * 2];
+            sr1 = s->pcm[f1 * 2 + 1];
+        }
+
+        // Linear interpolation
+        int sl = sl0 + (((sl1 - sl0) * frac) >> 8);
+        int sr = sr0 + (((sr1 - sr0) * frac) >> 8);
 
         accL[i] += (int)(sl * v->gain);
         accR[i] += (int)(sr * v->gain);
-        v->pos += v->step;
+        
+        v->pos_frac += v->step_frac;
+        if (v->pos_frac < v->step_frac) {
+            v->pos_int += v->step_int + 1;
+        } else {
+            v->pos_int += v->step_int;
+        }
     }
 }
 
@@ -394,10 +419,14 @@ static int mixer_thread(SceSize args, void *argp) {
         pthread_mutex_unlock(&gLock);
 
         for (int i = 0; i < MIX_GRAIN; i++) {
-            int l = accL[i];
-            int r = accR[i];
+            // Apply a slight master headroom reduction (~0.7) to prevent hard clipping distortion
+            // when many voices play simultaneously.
+            int l = (accL[i] * 180) / 256;
+            int r = (accR[i] * 180) / 256;
+            
             if (l > 32767) l = 32767; else if (l < -32768) l = -32768;
             if (r > 32767) r = 32767; else if (r < -32768) r = -32768;
+            
             outBuf[i * 2] = (short) l;
             outBuf[i * 2 + 1] = (short) r;
         }
@@ -428,7 +457,7 @@ void audio_init(void) {
     pthread_mutex_init(&gCacheLock, NULL);
     pthread_mutex_init(&gQueueLock, NULL);
 
-    gPort = sceAudioOutOpenPort(SCE_AUDIO_OUT_PORT_TYPE_BGM, MIX_GRAIN, MIX_RATE, SCE_AUDIO_OUT_MODE_STEREO);
+    gPort = sceAudioOutOpenPort(SCE_AUDIO_OUT_PORT_TYPE_MAIN, MIX_GRAIN, MIX_RATE, SCE_AUDIO_OUT_MODE_STEREO);
     if (gPort < 0) {
         l_error("[audio] sceAudioOutOpenPort failed (0x%08X)", (unsigned) gPort);
         return;
@@ -461,7 +490,7 @@ void audio_init(void) {
     }
 
     gAudioReady = true;
-    l_success("[audio] audio subsystem initialized successfully (sceAudioOut 44.1kHz stereo)");
+    l_success("[audio] audio subsystem initialized successfully (sceAudioOut 48kHz stereo)");
 }
 
 void audio_shutdown(void) {
@@ -560,8 +589,12 @@ void audio_play_sound(int sndId, int instance, float vol) {
     }
     if (!v) v = &gVoices[0]; // steal oldest
 
-    v->pos = 0.0;
-    v->step = (double) s->rate / (double) MIX_RATE;
+    double step_d = (double) s->rate / (double) MIX_RATE;
+    v->step_int = (unsigned int) step_d;
+    v->step_frac = (unsigned int) ((step_d - (double)v->step_int) * 4294967296.0);
+    v->pos_int = 0;
+    v->pos_frac = 0;
+    v->pitch = 1.0f;
     v->gain = v->targetGain = vol;
     v->fadeFramesLeft = 0;
     v->gainStep = 0.0f;
@@ -583,8 +616,12 @@ void audio_play_sound_big(int sndId, float vol, int loop) {
     if (vol > 1.0f) vol = 1.0f;
 
     pthread_mutex_lock(&gLock);
-    gBig.pos = 0.0;
-    gBig.step = (double) s->rate / (double) MIX_RATE;
+    double step_d = (double) s->rate / (double) MIX_RATE;
+    gBig.step_int = (unsigned int) step_d;
+    gBig.step_frac = (unsigned int) ((step_d - (double)gBig.step_int) * 4294967296.0);
+    gBig.pos_int = 0;
+    gBig.pos_frac = 0;
+    gBig.pitch = 1.0f;
     gBig.gain = gBig.targetGain = vol;
     gBig.fadeFramesLeft = 0;
     gBig.gainStep = 0.0f;
@@ -699,6 +736,9 @@ void GLMediaPlayer_setVolume(jmethodID id, va_list args) {
     int sndId = va_arg(args, jint);
     int instance = va_arg(args, jint);
     float vol = (float) va_arg(args, double);
+    if (vol < 0.0f) vol = 0.0f;
+    if (vol > 1.0f) vol = 1.0f;
+    
     pthread_mutex_lock(&gLock);
     for (int i = 0; i < MAX_VOICES; i++) {
         if (gVoices[i].smp && gVoices[i].sndId == sndId && gVoices[i].instance == instance)
@@ -711,13 +751,34 @@ void GLMediaPlayer_setVolumeBig(jmethodID id, va_list args) {
     (void) id;
     (void) va_arg(args, jint);
     float vol = (float) va_arg(args, double);
+    if (vol < 0.0f) vol = 0.0f;
+    if (vol > 1.0f) vol = 1.0f;
+    
     pthread_mutex_lock(&gLock);
     gBig.gain = gBig.targetGain = vol;
     pthread_mutex_unlock(&gLock);
 }
 
 void GLMediaPlayer_resetSound(jmethodID id, va_list args) { (void) id; (void) args; }
-void GLMediaPlayer_setPitch(jmethodID id, va_list args) { (void) id; (void) args; }
+void GLMediaPlayer_setPitch(jmethodID id, va_list args) {
+    (void) id;
+    int sndId = va_arg(args, jint);
+    int instance = va_arg(args, jint);
+    float pitch = (float) va_arg(args, double);
+    if (pitch < 0.1f) pitch = 0.1f;
+    if (pitch > 4.0f) pitch = 4.0f;
+
+    pthread_mutex_lock(&gLock);
+    for (int i = 0; i < MAX_VOICES; i++) {
+        if (gVoices[i].smp && gVoices[i].sndId == sndId && gVoices[i].instance == instance) {
+            gVoices[i].pitch = pitch;
+            double step_d = ((double)gVoices[i].smp->rate / (double)MIX_RATE) * (double)pitch;
+            gVoices[i].step_int = (unsigned int) step_d;
+            gVoices[i].step_frac = (unsigned int) ((step_d - (double)gVoices[i].step_int) * 4294967296.0);
+        }
+    }
+    pthread_mutex_unlock(&gLock);
+}
 
 void GLMediaPlayer_stopAllSounds(jmethodID id, va_list args) {
     (void) id; (void) args;

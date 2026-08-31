@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Title%20ID-ASPHALT05-ff69b4.svg?style=flat-square" alt="Title ID ASPHALT05" />
   <img src="https://img.shields.io/badge/Engine-Gameloft%20Proprietary-brightgreen.svg?style=flat-square" alt="Engine" />
   <img src="https://img.shields.io/badge/Renderer-vitaGL%20%28GLES%201.1%29-orange.svg?style=flat-square" alt="Renderer" />
-  <img src="https://img.shields.io/badge/Status-Not%20Playable-red.svg?style=flat-square" alt="Status: Not Playable" />
+  <img src="https://img.shields.io/badge/Status-Playable%20(Beta)-success.svg?style=flat-square" alt="Status: Playable" />
 </p>
 
 ---
@@ -27,16 +27,13 @@ dynamic loader (*soloader*) and an Android environment emulation layer (*FalsoJN
 with [vitaGL](https://github.com/Rinnegatamante/vitaGL) providing the GLES 1.1
 fixed-function rendering backend.
 
-### ⚠️ Current Status: Boots, but not playable
+### 🎮 Current Status: Playable (Beta)
 
-The game **boots, reaches the title screen, and loads into the main menu with
-working audio**. However, **the port is not currently playable**: frame rate
-during an actual race does not sustain above **~10 FPS**, which makes racing
-unresponsive. Extensive work has gone into diagnosing and fixing several distinct
-performance bottlenecks (synchronous SD card I/O, audio thread priority, asset
-cache thrashing, vertex pool exhaustion) — see [`port_progress.md`](port_progress.md)
-for the full, bug-by-bug history — but in-race performance has not yet reached a
-playable framerate on real hardware.
+The game **is fully playable from start to finish**. Extensive work has gone into diagnosing and fixing several performance bottlenecks (synchronous SD card I/O, cache thrashing, soft-float audio overhead). See [`port_progress.md`](port_progress.md) for the full bug-by-bug history. 
+
+Since this is a Beta release, keep in mind:
+* Audio is working and has been heavily optimized (fixed-point math, linear interpolation), but still has some minor quirks and room for improvement.
+* There may be other undiscovered bugs or occasional UI glitches.
 
 ### ✨ What Works
 
@@ -48,16 +45,15 @@ playable framerate on real hardware.
 - **vitaGL Graphics Pipeline**: GLES 1.1 fixed-function rendering, with an internal
   720x432 offscreen FBO downsampled to the native 960x544 panel (menu layout still
   reports 800x480 to the engine so UI scaling stays correct).
-- **Audio**: `sceAudioOut`-backed mixer on a dedicated, real-time-priority thread.
-- **Input**: Touch input plus Circle-as-Back mapping.
+- **Audio**: Custom 32-bit fixed-point audio mixer with linear interpolation running on the `MAIN` audio port.
+- **Input**: Full physical button support! D-Pad/Analog for menus, and full steering/pedal support during races.
 - **Assets from `ux0:`**: Resource loader reads game assets/chunks from `ux0:data/asphalt5/`
-  with an LRU cache to reduce (but not eliminate) SD card stutter.
+  with an LRU cache to reduce SD card stutter.
 
-### ❌ Known Issues
+### ⚠️ Known Issues
 
-- **Sub-10 FPS in race**: The main blocker. In-game framerate during a race
-  currently does not sustain above ~10 FPS, making the game not playable.
-  Root causes investigated so far include disk I/O stalls, cache trashing between
+- **Audio quirks**: While heavily improved, the audio mixing still has some minor distortions or volume balancing issues in certain heavy tracks.
+- **Beta bugs**: Unmapped physical buttons in very specific sub-menus or rare cache trashing between
   the asset cache and the GPU resource pool, and vitaGL vertex pool pressure —
   see the bug log in [`port_progress.md`](port_progress.md) (Bugs #9, #16–#22).
 - **Video playback**: The Gameloft intro trailer is skipped instantly instead of

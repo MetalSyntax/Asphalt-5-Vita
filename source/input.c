@@ -12,6 +12,9 @@
 #include <psp2/touch.h>
 #include <psp2/ctrl.h>
 
+#include <so_util/so_util.h>
+extern so_module so_mod;
+
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
@@ -127,25 +130,129 @@ static void poll_touch(void * env, void * clazz) {
     }
 }
 
+typedef enum {
+    APP_STATE_UNKNOWN,
+    APP_STATE_MENU,
+    APP_STATE_TITLE,
+    APP_STATE_INGAME
+} app_state_t;
+
+static app_state_t get_current_app_state(void) {
+    static void *g_pMainGameClass = NULL;
+    static void *vtable_GS_Run = NULL;
+    static void *vtable_GS_Splash = NULL;
+    static void *vtable_GS_GLLogo = NULL;
+    static void *vtable_GS_TrailerMovie = NULL;
+
+    if (!g_pMainGameClass) {
+        g_pMainGameClass = (void*)so_symbol(&so_mod, "g_pMainGameClass");
+        vtable_GS_Run = (void*)so_symbol(&so_mod, "_ZTV6GS_Run");
+        vtable_GS_Splash = (void*)so_symbol(&so_mod, "_ZTV9GS_Splash");
+        vtable_GS_GLLogo = (void*)so_symbol(&so_mod, "_ZTV9GS_GLLogo");
+        vtable_GS_TrailerMovie = (void*)so_symbol(&so_mod, "_ZTV15GS_TrailerMovie");
+    }
+
+    if (!g_pMainGameClass || !vtable_GS_Run)
+        return APP_STATE_UNKNOWN;
+
+    void *game = *(void**)g_pMainGameClass;
+    if (!game) return APP_STATE_UNKNOWN;
+
+    int top = *(int*)((uintptr_t)game + 0x1D38);
+    if (top < 0 || top > 10) return APP_STATE_UNKNOWN; // Sanity check
+
+    void *state = *(void**)((uintptr_t)game + 0x1D3C + top * 4);
+    if (!state) return APP_STATE_UNKNOWN;
+
+    void *vtable = *(void**)state;
+    // In the Itanium C++ ABI (used by ARM), an object's vptr points to the first function
+    // in the vtable, which is 8 bytes after the vtable symbol (skipping offset-to-top and typeinfo).
+    void *vtable_base = (void*)((uintptr_t)vtable - 8);
+
+    if (vtable_base == vtable_GS_Run)
+        return APP_STATE_INGAME;
+    if (vtable_base == vtable_GS_Splash || vtable_base == vtable_GS_GLLogo || vtable_base == vtable_GS_TrailerMovie)
+        return APP_STATE_TITLE;
+
+    return APP_STATE_MENU;
+}
+
+// Track fake touches to emit pressed/released
+static bool s_fake_left_down = false;
+static bool s_fake_right_down = false;
+static bool s_fake_cross_down = false;
+static bool s_fake_square_down = false;
+static bool s_fake_start_down = false;
+
 static void poll_keys(void * env, void * clazz) {
-    // KeyEvent.KEYCODE_BACK -- the only keycode libasphalt5.so's
-    // notifyKeyPressed/Released path is confirmed to branch on
-    // (`param_2 == 4` in several menu/dialog handlers). Circle is the
-    // universal Vita "back/cancel" button regardless of region button swap.
     SceCtrlData pad;
     if (sceCtrlPeekBufferPositive(0, &pad, 1) < 0)
         return;
 
+    app_state_t state = get_current_app_state();
+
+    if (state == APP_STATE_INGAME) {
+        // IN-GAME Mapping
+        bool left_down = (pad.buttons & SCE_CTRL_LEFT) != 0 || (pad.buttons & SCE_CTRL_LTRIGGER) != 0;
+        bool right_down = (pad.buttons & SCE_CTRL_RIGHT) != 0 || (pad.buttons & SCE_CTRL_RTRIGGER) != 0;
+        bool cross_down = (pad.buttons & SCE_CTRL_CROSS) != 0;
+        bool square_down = (pad.buttons & SCE_CTRL_SQUARE) != 0;
+        bool start_down = (pad.buttons & SCE_CTRL_START) != 0;
+
+        // Virtual Touch Slots (0 and 1 are used by real touch, but we can reuse them if touch is inactive)
+        // We split into two slots: Slot 0 for steering, Slot 1 for pedals/actions.
+        
+        #define DISPATCH_TOUCH(btn_state, is_down, tx, ty, slot) \
+            if (is_down != btn_state) { \
+                btn_state = is_down; \
+                if (is_down && s_pressed) s_pressed(env, clazz, tx, ty, slot); \
+                else if (!is_down && s_released) s_released(env, clazz, tx, ty, slot); \
+            }
+
+        // Steer Left (Left blank area) -> Slot 0
+        DISPATCH_TOUCH(s_fake_left_down, left_down, 100, 240, 0);
+        // Steer Right (Right blank area) -> Slot 0
+        DISPATCH_TOUCH(s_fake_right_down, right_down, 700, 240, 0);
+        
+        // Nitrous (Cross) -> Slot 1
+        DISPATCH_TOUCH(s_fake_cross_down, cross_down, 720, 400, 1);
+        // Brake (Square) -> Slot 1
+        DISPATCH_TOUCH(s_fake_square_down, square_down, 50, 430, 1);
+        // Pause (Start) -> Slot 1
+        DISPATCH_TOUCH(s_fake_start_down, start_down, 50, 50, 1);
+
+    } else if (state == APP_STATE_TITLE) {
+        bool any_down = (pad.buttons & (SCE_CTRL_CROSS | SCE_CTRL_SQUARE | SCE_CTRL_TRIANGLE | SCE_CTRL_START)) != 0;
+        DISPATCH_TOUCH(s_fake_start_down, any_down, 400, 240, 1);
+
+    } else {
+        // MENU Mapping (APP_STATE_MENU)
+        bool up_down = (pad.buttons & SCE_CTRL_UP) != 0 || pad.ly < 64;
+        bool down_down = (pad.buttons & SCE_CTRL_DOWN) != 0 || pad.ly > 192;
+        bool cross_down = (pad.buttons & SCE_CTRL_CROSS) != 0;
+
+        #define DISPATCH_KEY(btn_state, is_down, keycode) \
+            if (is_down != btn_state) { \
+                btn_state = is_down; \
+                if (is_down && s_key_down) s_key_down(env, clazz, keycode); \
+                else if (!is_down && s_key_up) s_key_up(env, clazz, keycode); \
+            }
+
+        DISPATCH_KEY(s_fake_left_down, up_down, 19); // KEYCODE_DPAD_UP
+        DISPATCH_KEY(s_fake_right_down, down_down, 20); // KEYCODE_DPAD_DOWN
+        DISPATCH_KEY(s_fake_cross_down, cross_down, 23); // KEYCODE_DPAD_CENTER
+
+        #undef DISPATCH_KEY
+    }
+
+    #undef DISPATCH_TOUCH
+
+    // Default universal BACK button (Circle) for menus
     bool circle_down = (pad.buttons & SCE_CTRL_CIRCLE) != 0;
     if (circle_down != s_circle_was_down) {
         s_circle_was_down = circle_down;
-        if (circle_down) {
-            if (s_key_down)
-                s_key_down(env, clazz, 4 /* KEYCODE_BACK */);
-        } else {
-            if (s_key_up)
-                s_key_up(env, clazz, 4 /* KEYCODE_BACK */);
-        }
+        if (circle_down && s_key_down) s_key_down(env, clazz, 4 /* KEYCODE_BACK */);
+        else if (!circle_down && s_key_up) s_key_up(env, clazz, 4 /* KEYCODE_BACK */);
     }
 }
 
