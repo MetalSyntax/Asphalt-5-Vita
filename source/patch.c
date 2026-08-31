@@ -14,7 +14,10 @@
 #include <kubridge.h>
 #include <so_util/so_util.h>
 
+#include <psp2/kernel/processmgr.h>
 #include <string.h>
+
+#include "perf_telemetry_hooks.h"
 
 extern so_module so_mod;
 
@@ -97,6 +100,89 @@ static int hook_BaseSoundManager_ret0() {
     return 0;
 }
 
+#ifdef ENABLE_PERF_TELEMETRY
+/*
+ * Diagnostic-only: bracket the 4 top-level per-frame phases confirmed in
+ * decompiled/libasphalt5_armeabi/ghidra/out_ghidra.c (Scene::Update(),
+ * Scene::UpdateCars(), Scene::Render(), Scene::RenderInterface() -- all
+ * `(this)`-only, no other params) with PHASE_ENTER/PHASE_EXIT telemetry, to
+ * find which one is running when a frame collapses or the GPU hard-crashes
+ * (Bug #19/#20/#22). SO_CONTINUE (so_util.h) temporarily restores the two
+ * instructions hook_addr() overwrote, calls straight into the untouched
+ * function body, then re-applies the hook -- the original logic runs
+ * unmodified, only timing is added around it.
+ */
+static so_hook s_hook_scene_update;
+static so_hook s_hook_scene_update_cars;
+static so_hook s_hook_scene_render;
+static so_hook s_hook_scene_render_interface;
+
+static int hook_Scene_Update(void *this_) {
+    perf_telemetry_phase_enter("Scene::Update");
+    SceUInt64 t0 = sceKernelGetProcessTimeWide();
+    int r = SO_CONTINUE(int, s_hook_scene_update, this_);
+    perf_telemetry_phase_exit("Scene::Update", sceKernelGetProcessTimeWide() - t0);
+    return r;
+}
+
+static int hook_Scene_UpdateCars(void *this_) {
+    perf_telemetry_phase_enter("Scene::UpdateCars");
+    SceUInt64 t0 = sceKernelGetProcessTimeWide();
+    int r = SO_CONTINUE(int, s_hook_scene_update_cars, this_);
+    perf_telemetry_phase_exit("Scene::UpdateCars", sceKernelGetProcessTimeWide() - t0);
+    return r;
+}
+
+static int hook_Scene_Render(void *this_) {
+    perf_telemetry_phase_enter("Scene::Render");
+    SceUInt64 t0 = sceKernelGetProcessTimeWide();
+    int r = SO_CONTINUE(int, s_hook_scene_render, this_);
+    perf_telemetry_phase_exit("Scene::Render", sceKernelGetProcessTimeWide() - t0);
+    return r;
+}
+
+static int hook_Scene_RenderInterface(void *this_) {
+    perf_telemetry_phase_enter("Scene::RenderInterface");
+    SceUInt64 t0 = sceKernelGetProcessTimeWide();
+    int r = SO_CONTINUE(int, s_hook_scene_render_interface, this_);
+    perf_telemetry_phase_exit("Scene::RenderInterface", sceKernelGetProcessTimeWide() - t0);
+    return r;
+}
+
+/*
+ * Sub-phases inside Scene::Render() (see out_ghidra.c:46136), added after the
+ * first console capture showed Scene::Render() itself taking 488ms then
+ * 3.5s (crash) while the only other phase nested in it, RenderInterface, took
+ * 11-15us -- ruling out RenderInterface and narrowing the search to whatever
+ * else Render() calls directly:
+ *   - gxRenderGroup::RenderGroups(group, bool) -- called ~5x per Render() for
+ *     road/track geometry (opaque, reflection blend/add, transparent group
+ *     passes); the single function most likely to hit vitaGL's vertex pool
+ *     (Bug #19/#20/#22) since it submits the bulk of the scene's geometry.
+ *   - Scene::RenderCars(uchar) -- car meshes, the other big geometry submitter.
+ * Both are hooked the same SO_CONTINUE way as Scene::Render() etc. above --
+ * timing added around the untouched original, no behavior change.
+ */
+static so_hook s_hook_rendergroups;
+static so_hook s_hook_scene_rendercars;
+
+static int hook_gxRenderGroup_RenderGroups(int group_ptr, int reflect_flag) {
+    perf_telemetry_phase_enter("gxRenderGroup::RenderGroups");
+    SceUInt64 t0 = sceKernelGetProcessTimeWide();
+    int r = SO_CONTINUE(int, s_hook_rendergroups, group_ptr, reflect_flag);
+    perf_telemetry_phase_exit("gxRenderGroup::RenderGroups", sceKernelGetProcessTimeWide() - t0);
+    return r;
+}
+
+static int hook_Scene_RenderCars(void *this_, int param) {
+    perf_telemetry_phase_enter("Scene::RenderCars");
+    SceUInt64 t0 = sceKernelGetProcessTimeWide();
+    int r = SO_CONTINUE(int, s_hook_scene_rendercars, this_, param);
+    perf_telemetry_phase_exit("Scene::RenderCars", sceKernelGetProcessTimeWide() - t0);
+    return r;
+}
+#endif // ENABLE_PERF_TELEMETRY
+
 void so_patch(void) {
     hook_addr((uintptr_t) so_symbol(&so_mod, "_ZN7CMatrix4MultEPS_"),
               (uintptr_t) &hook_CMatrix_Mult);
@@ -115,4 +201,22 @@ void so_patch(void) {
     hook_addr((uintptr_t) so_symbol(&so_mod, "_ZN16BaseSoundManager19stopAllSecondMusicsEv"), (uintptr_t) &hook_BaseSoundManager_stopAllSounds);
     hook_addr((uintptr_t) so_symbol(&so_mod, "_ZN16BaseSoundManager6updateEi"), (uintptr_t) &hook_BaseSoundManager_ret0);
     hook_addr((uintptr_t) so_symbol(&so_mod, "_ZN16BaseSoundManager14isSoundPlayingEiii"), (uintptr_t) &hook_BaseSoundManager_ret0);
+
+#ifdef ENABLE_PERF_TELEMETRY
+    // Was previously missing entirely -- hook_Scene_* were defined above but
+    // never installed, so Scene::Update()/UpdateCars()/Render()/
+    // RenderInterface() ran unhooked and no PHASE_ENTER/PHASE_EXIT ever fired.
+    s_hook_scene_update = hook_addr(
+            (uintptr_t) so_symbol(&so_mod, "_ZN5Scene6UpdateEv"), (uintptr_t) &hook_Scene_Update);
+    s_hook_scene_update_cars = hook_addr(
+            (uintptr_t) so_symbol(&so_mod, "_ZN5Scene10UpdateCarsEv"), (uintptr_t) &hook_Scene_UpdateCars);
+    s_hook_scene_render = hook_addr(
+            (uintptr_t) so_symbol(&so_mod, "_ZN5Scene6RenderEv"), (uintptr_t) &hook_Scene_Render);
+    s_hook_scene_render_interface = hook_addr(
+            (uintptr_t) so_symbol(&so_mod, "_ZN5Scene15RenderInterfaceEv"), (uintptr_t) &hook_Scene_RenderInterface);
+    s_hook_rendergroups = hook_addr(
+            (uintptr_t) so_symbol(&so_mod, "_ZN13gxRenderGroup12RenderGroupsEib"), (uintptr_t) &hook_gxRenderGroup_RenderGroups);
+    s_hook_scene_rendercars = hook_addr(
+            (uintptr_t) so_symbol(&so_mod, "_ZN5Scene10RenderCarsEh"), (uintptr_t) &hook_Scene_RenderCars);
+#endif
 }

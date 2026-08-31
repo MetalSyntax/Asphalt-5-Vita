@@ -2,3 +2,6 @@
 	path = lib/falso_jni
 	url = https://github.com/v-atamanenko/FalsoJNI.git
 	branch = master
+[submodule "lib/vitagl"]
+	path = lib/vitagl
+	url = https://github.com/Rinnegatamante/vitaGL.git

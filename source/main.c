@@ -7,6 +7,10 @@
 #include "input.h"
 #include "audio.h"
 
+#ifdef ENABLE_PERF_TELEMETRY
+#include "perf_telemetry_hooks.h"
+#endif
+
 #include <psp2/kernel/threadmgr.h>
 
 #include <falso_jni/FalsoJNI.h>
@@ -180,8 +184,21 @@ int main() {
 
     while (1) {
         input_poll(&jni, &jni);
+#ifdef ENABLE_PERF_TELEMETRY
+        // FRAME covers one full Render()+present -- exactly the span the
+        // Scene:: PHASE_ENTER/PHASE_EXIT pairs from patch.c subdivide, so a
+        // FRAME spike can be matched to the phase that ate it. VGLPOOL is
+        // sampled once per frame, after render, to catch the vertex pool
+        // (see gl_init()) trending toward the Bug #19/#20/#22 exhaustion
+        // before it hard-crashes the GPU.
+        perf_telemetry_frame_begin();
+#endif
         Renderer_nativeRender(&jni, &jni);
         gl_swap();
+#ifdef ENABLE_PERF_TELEMETRY
+        perf_telemetry_frame_end();
+        perf_telemetry_vgl_pool_sample();
+#endif
         media_pump();
     }
 
