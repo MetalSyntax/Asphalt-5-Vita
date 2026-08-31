@@ -15,7 +15,7 @@
 #define RES_PATH DATA_PATH "data/"
 
 // --- JDA Pool (For returning byte arrays to the engine) ---
-#define RES_POOL_SLOTS 16
+#define RES_POOL_SLOTS 48
 typedef struct {
     JavaDynArray * jda;
     jsize          cap;
@@ -47,15 +47,13 @@ static JavaDynArray * pool_take(jsize len) {
 }
 
 // --- RAM File Cache (To avoid hitting the SD card synchronously) ---
-// REVERTED (2026-08-28): this was bumped to 128 to cover the full 113-file
-// working set (see port_progress.md), but it made the engine stream assets
-// fast enough to push MORE geometry per frame into vitaGL's fixed-size
-// vertex pool than before -- confirmed on hardware via a GPU crash whose
-// backtrace (gpu_alloc_mapped_aligned <- _glDrawElements_FixedFunctionIMPL
-// <- glDrawElements) is IDENTICAL to Bug #19's crash, just triggered at a
-// higher streaming throughput. Reverting to the value Bug #19 verified as
-// stable rather than guessing at a bigger vertex pool without being able to
-// test it on real hardware from this environment.
+// FIXED (2026-08-30): this was at 128 while RES_POOL_SLOTS above had been
+// silently dropped to 16 in the same commit that wrote the comment below --
+// the exact imbalance the comment itself warns about (more slots here means
+// the engine streams assets fast enough to queue more geometry per frame
+// than RES_POOL_SLOTS can hold without a buffer being recycled while GPU
+// still reads it -- the Bug #19/#20 GPU crash). RES_POOL_SLOTS restored to
+// 48 (the value Bug #19 verified stable) so the two stay matched again.
 #define RAM_CACHE_SLOTS 128
 
 typedef struct {

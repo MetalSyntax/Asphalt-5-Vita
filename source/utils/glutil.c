@@ -45,17 +45,12 @@ void gl_preload() {
  * Resolution reported to the engine (see main.c's SCREEN_W/H, told to it via
  * Renderer_nativeInit()/OS_SCREEN_H) -- its menu/UI layout needs exactly
  * this value, confirmed on hardware: reporting the real 960x544 broke menu
- * layout. The whole scene renders into an offscreen FBO at THIS size instead
- * of the real framebuffer, so it's genuinely fewer pixels to rasterize/shade
- * than native (~26% fewer than 960x544) -- a real performance win, unlike an
- * earlier attempt that kept the real 960x544 framebuffer and just remapped
- * glViewport/glScissor calls onto it (same pixel count either way, so no
- * actual GPU work was saved, and the integer-division rescale was the
- * leading suspect for a GPU crash -- see port_progress.md bug #8). gl_swap()
- * does one upscale blit from this FBO onto the real screen before presenting.
+ * layout. Every glViewport/glScissor call the engine issues is expressed in
+ * THIS space -- glViewport_soloader()/glScissor_soloader() below rescale
+ * them onto the actual (smaller) OFFSCREEN_W/H FBO declared in glutil.h.
  */
-#define OFFSCREEN_W 800
-#define OFFSCREEN_H 480
+#define SCREEN_W 800
+#define SCREEN_H 480
 
 static GLuint s_ds_fbo = 0;
 static GLuint s_ds_color_tex = 0;
@@ -92,8 +87,8 @@ static void gl_init_downsample() {
         return;
     }
 
-    l_success("Downsample FBO ready: %dx%d (native %dx%d).",
-              OFFSCREEN_W, OFFSCREEN_H, REAL_SCREEN_W, REAL_SCREEN_H);
+    l_success("Downsample FBO ready: %dx%d (reported %dx%d, native %dx%d).",
+              OFFSCREEN_W, OFFSCREEN_H, SCREEN_W, SCREEN_H, REAL_SCREEN_W, REAL_SCREEN_H);
 
     // The color texture was allocated via glTexImage2D(..., NULL) -- its
     // initial content is undefined GPU memory, not guaranteed black. Force
@@ -115,6 +110,98 @@ void gl_init() {
     gl_init_downsample();
 }
 
+/*
+ * Rescale a rect from the 800x480 space the engine was told the screen is
+ * (SCREEN_W/H) onto the actual OFFSCREEN_W/H FBO attachment. Multiply before
+ * divide (never divide first) to keep rounding error small, and clamp the
+ * result into the FBO's bounds so a rect that lands exactly on the 800/480
+ * edge can never produce an out-of-range viewport/scissor rect for GXM --
+ * that combination (undersized real framebuffer + an unclamped rescaled
+ * rect) was the leading suspect for the GPU crash in the reverted Bug #8
+ * attempt. 720/800 and 432/480 both reduce to exactly 9/10, so this is exact
+ * (no rounding at all) for the common full-screen case and any rect whose
+ * edges are multiples of 10 in engine space.
+ */
+static void rescale_to_offscreen(GLint x, GLint y, GLsizei w, GLsizei h,
+                                  GLint * out_x, GLint * out_y,
+                                  GLsizei * out_w, GLsizei * out_h) {
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+    if (w < 0) w = 0;
+    if (h < 0) h = 0;
+
+    GLint rx = (x * OFFSCREEN_W) / SCREEN_W;
+    GLint ry = (y * OFFSCREEN_H) / SCREEN_H;
+    GLsizei rw = (w * OFFSCREEN_W) / SCREEN_W;
+    GLsizei rh = (h * OFFSCREEN_H) / SCREEN_H;
+
+    if (rx > OFFSCREEN_W) rx = OFFSCREEN_W;
+    if (ry > OFFSCREEN_H) ry = OFFSCREEN_H;
+    if (rw > OFFSCREEN_W - rx) rw = OFFSCREEN_W - rx;
+    if (rh > OFFSCREEN_H - ry) rh = OFFSCREEN_H - ry;
+
+    *out_x = rx;
+    *out_y = ry;
+    *out_w = rw;
+    *out_h = rh;
+}
+
+void glViewport_soloader(GLint x, GLint y, GLsizei width, GLsizei height) {
+    GLint rx, ry;
+    GLsizei rw, rh;
+    rescale_to_offscreen(x, y, width, height, &rx, &ry, &rw, &rh);
+    glViewport(rx, ry, rw, rh);
+}
+
+void glScissor_soloader(GLint x, GLint y, GLsizei width, GLsizei height) {
+    GLint rx, ry;
+    GLsizei rw, rh;
+    rescale_to_offscreen(x, y, width, height, &rx, &ry, &rw, &rh);
+    glScissor(rx, ry, rw, rh);
+}
+
+// See the comment on the matching externs in glutil.h -- only updated by the
+// engine's own calls (routed here via dynlib.c's import table), never by
+// this port's own GL calls, which link the real vitaGL entry points instead
+// of these wrappers. GLES1.1 defaults: all disabled.
+GLboolean g_shadow_depth_test   = GL_FALSE;
+GLboolean g_shadow_blend        = GL_FALSE;
+GLboolean g_shadow_scissor_test = GL_FALSE;
+GLboolean g_shadow_cull_face    = GL_FALSE;
+GLboolean g_shadow_vertex_array = GL_FALSE;
+
+void glEnable_soloader(GLenum cap) {
+    switch (cap) {
+        case GL_DEPTH_TEST:    g_shadow_depth_test   = GL_TRUE; break;
+        case GL_BLEND:         g_shadow_blend        = GL_TRUE; break;
+        case GL_SCISSOR_TEST:  g_shadow_scissor_test = GL_TRUE; break;
+        case GL_CULL_FACE:     g_shadow_cull_face    = GL_TRUE; break;
+        default: break;
+    }
+    glEnable(cap);
+}
+
+void glDisable_soloader(GLenum cap) {
+    switch (cap) {
+        case GL_DEPTH_TEST:    g_shadow_depth_test   = GL_FALSE; break;
+        case GL_BLEND:         g_shadow_blend        = GL_FALSE; break;
+        case GL_SCISSOR_TEST:  g_shadow_scissor_test = GL_FALSE; break;
+        case GL_CULL_FACE:     g_shadow_cull_face    = GL_FALSE; break;
+        default: break;
+    }
+    glDisable(cap);
+}
+
+void glEnableClientState_soloader(GLenum array) {
+    if (array == GL_VERTEX_ARRAY) g_shadow_vertex_array = GL_TRUE;
+    glEnableClientState(array);
+}
+
+void glDisableClientState_soloader(GLenum array) {
+    if (array == GL_VERTEX_ARRAY) g_shadow_vertex_array = GL_FALSE;
+    glDisableClientState(array);
+}
+
 // One upscale blit from the downsample FBO onto the real 960x544 screen,
 // then present. A plain non-uniform stretch (OFFSCREEN is 5:3, the real
 // screen is ~16:9) -- same stretch ratios the engine's own reported
@@ -122,24 +209,37 @@ void gl_init() {
 // what was already on screen, just genuinely cheaper to render.
 static void gl_blit_downsample_to_screen() {
     // SAVE STATE
+    // Viewport and the 4 boolean caps below come from the shadow state that
+    // glViewport_soloader() (well, glViewport itself is left un-shadowed --
+    // see below)/glEnable_soloader()/glDisable_soloader() maintain, instead
+    // of glGetIntegerv()/glIsEnabled() round-trips every single frame. The
+    // engine's own glViewport calls already went through glViewport_soloader
+    // to get rescaled onto OFFSCREEN_W/H (see above), so their *result* is
+    // exactly what plain glGetIntegerv(GL_VIEWPORT) would have returned
+    // anyway -- shadowing that one too would just be duplicating state GL
+    // already holds for free, so it stays a real query.
     GLint old_vp[4];
     glGetIntegerv(GL_VIEWPORT, old_vp);
-    GLboolean depth_test = glIsEnabled(GL_DEPTH_TEST);
-    GLboolean blend = glIsEnabled(GL_BLEND);
-    GLboolean scissor = glIsEnabled(GL_SCISSOR_TEST);
-    GLboolean cull = glIsEnabled(GL_CULL_FACE);
+    GLboolean depth_test = g_shadow_depth_test;
+    GLboolean blend = g_shadow_blend;
+    GLboolean scissor = g_shadow_scissor_test;
+    GLboolean cull = g_shadow_cull_face;
     GLboolean tex2d = glIsEnabled(GL_TEXTURE_2D);
-    
+
     GLint old_tex;
     glGetIntegerv(GL_TEXTURE_BINDING_2D, &old_tex);
-    
+
     GLint old_env;
     glGetTexEnviv(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, &old_env);
-    
+
     GLfloat old_color[4];
     glGetFloatv(GL_CURRENT_COLOR, old_color);
 
-    GLboolean v_array = glIsEnabled(GL_VERTEX_ARRAY);
+    // GL_VERTEX_ARRAY isn't per-texture-unit, so its shadow is always
+    // correct; GL_TEXTURE_COORD_ARRAY IS per glClientActiveTexture unit and
+    // the engine does use multitexturing, so it stays a real query (see the
+    // comment on the shadow externs in glutil.h).
+    GLboolean v_array = g_shadow_vertex_array;
     GLboolean t_array = glIsEnabled(GL_TEXTURE_COORD_ARRAY);
 
     // BLIT

@@ -205,18 +205,20 @@ static unsigned gVideoTexW = 0;
 static unsigned gVideoTexH = 0;
 
 /*
- * NOT the real 960x544 Vita screen -- the downsample FBO glutil.c's
- * gl_init() sets up (800x480, see OFFSCREEN_W/H there) stays bound for the
- * entire program, including while this cutscene player is drawing (nothing
- * here ever rebinds a framebuffer). A viewport/quad sized for the real
- * screen would draw past the FBO's actual 800x480 color attachment and get
- * clipped by the GPU, cropping the video into the bottom-left corner --
- * the same bug class already fixed for the game's own rendering. gl_swap()
- * upscale-blits this FBO's full content (video included) onto the real
- * screen once per frame, so targeting 800x480 here is correct.
+ * NOT the real 960x544 Vita screen, and NOT the 800x480 the engine itself is
+ * told the screen is -- the downsample FBO glutil.c's gl_init() sets up
+ * (OFFSCREEN_W/H, defined in glutil.h so this stays in sync automatically)
+ * stays bound for the entire program, including while this cutscene player
+ * is drawing (nothing here ever rebinds a framebuffer). A viewport/quad
+ * sized for anything other than the FBO's actual attachment size would draw
+ * past it and get clipped by the GPU, cropping the video into a corner --
+ * the same bug class already fixed for the game's own rendering (see Bug
+ * #13 in port_progress.md). gl_swap() upscale-blits this FBO's full content
+ * (video included) onto the real screen once per frame, so targeting
+ * OFFSCREEN_W/H here is correct regardless of what that size is.
  */
-#define VIDEO_TARGET_W 800
-#define VIDEO_TARGET_H 480
+#define VIDEO_TARGET_W OFFSCREEN_W
+#define VIDEO_TARGET_H OFFSCREEN_H
 
 static bool gFirstDrawLogged = false;
 #define FIRST_DRAW_LOG(...) do { if (!gFirstDrawLogged) l_info(__VA_ARGS__); } while (0)

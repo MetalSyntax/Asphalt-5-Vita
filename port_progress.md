@@ -1555,3 +1555,99 @@ poder probarlo.
 **Pendiente:** si se quiere retomar la ampliación de la caché de assets, hacerlo en conjunto con un
 aumento medido del pool de vértices (probar en consola después de cada cambio, uno a la vez, no los
 dos juntos) para no perder de nuevo la trazabilidad de cuál cambio causó qué.
+
+## Sesión de rendimiento (2026-08-30) -- regresión de `RES_POOL_SLOTS` + 3 optimizaciones nuevas
+
+El usuario reportó el juego injugable a 1 FPS en carrera y pidió un cuadro de optimizaciones. Antes
+de proponer nada nuevo, se releyó el diff del último commit (`1978163`, Bug #21) contra el código
+actual.
+
+### Bug #22 -- CONFIRMADO Y CORREGIDO: `RES_POOL_SLOTS` había quedado en 16 (silenciosamente, en el mismo commit que subió `RAM_CACHE_SLOTS` a 128)
+
+**Evidencia (`git log -p`, no adivinado):** el commit `1978163` toca dos valores a la vez en
+`source/jni_resloader.c`:
+- `RAM_CACHE_SLOTS`: 48 -> 128
+- `RES_POOL_SLOTS`: 48 -> **16**
+
+El propio comentario que ese commit agrega arriba de `RAM_CACHE_SLOTS` describe textualmente
+"revertir a 48 porque produjo un GPU crash idéntico al Bug #19" -- pero el `#define` que sigue
+inmediatamente después quedaba en `128`, y `RES_POOL_SLOTS` bajó a `16` (peor que el `8` original que
+ya crasheaba en el Bug #19). Osea: el código vigente reproducía exactamente el mecanismo que el Bug
+#19/#20 ya habían documentado como causa de GPU crash (el motor puede streamear más rápido que nunca
+gracias a la caché de 128 slots, pero sólo hay 16 buffers de retorno para sostener esa geometría antes
+de que la GPU la lea -- reciclado de memoria mientras aún se dibuja).
+
+**Fix:** `RES_POOL_SLOTS` devuelto a `48` (el valor que el Bug #19 verificó estable), quedando ahora sí
+acorde con `RAM_CACHE_SLOTS=128`. Comentario del código corregido para no seguir describiendo un
+revert que en los hechos no se había aplicado.
+
+**Pendiente:** probar en consola. Es el cambio con más evidencia concreta de esta sesión.
+
+### Optimización -- estado de OpenGL cacheado en `gl_blit_downsample_to_screen()` en vez de consultado por frame
+
+`gl_blit_downsample_to_screen()` (llamada una vez por frame desde `gl_swap()`) hacía ~9
+`glGetIntegerv`/`glIsEnabled`/`glGetFloatv`/`glGetTexEnviv` para guardar el estado GL antes de dibujar
+su quad y restaurarlo después. Confirmado con `objdump -T` sobre el `.so` real que el motor sólo toca
+esos estados fixed-function vía `glEnable`/`glDisable`/`glEnableClientState`/`glDisableClientState`
+(sin variantes) para `GL_DEPTH_TEST`/`GL_BLEND`/`GL_SCISSOR_TEST`/`GL_CULL_FACE`/`GL_VERTEX_ARRAY` --
+ninguno de estos 5 es per-texture-unit, así que un solo flag por estado alcanza para reflejarlos
+siempre bien.
+
+**Fix:** `source/utils/glutil.c`/`.h` -- `glEnable_soloader`/`glDisable_soloader`/
+`glEnableClientState_soloader`/`glDisableClientState_soloader` (nuevos) actualizan 5 variables sombra
+globales y reenvían a la función real; `dynlib.c` ahora resuelve `glEnable`/`glDisable`/
+`glEnableClientState`/`glDisableClientState` del motor contra estos wrappers en vez de las funciones
+reales directamente. `gl_blit_downsample_to_screen()` lee esas 5 variables sombra en vez de
+`glIsEnabled()`. Deliberadamente **no** se tocaron `GL_TEXTURE_2D`/`GL_TEXTURE_BINDING_2D`/
+`GL_TEXTURE_ENV_MODE`/`GL_CURRENT_COLOR`/`GL_TEXTURE_COORD_ARRAY` -- el `.so` sí importa
+`glActiveTexture`/`glClientActiveTexture` (multitexturing real), y esos 5 estados son per-unit;
+sombrearlos bien habría necesitado un slot por unidad de textura, más superficie de bug para un
+ahorro marginal. Se prefirió cubrir sólo lo que es 100% seguro de sombrear con una sola variable.
+
+### Optimización -- FBO de downsample interno reducido de 800x480 a 720x432 (sin tocar la pantalla completa ni la resolución que ve el menú)
+
+**Objetivo del usuario:** bajar más la resolución interna sin dañar ni la pantalla completa (960x544
+real) ni el layout del menú (que necesita que se le reporte 800x480, Bug #10).
+
+**Fix:** `OFFSCREEN_W`/`OFFSCREEN_H` (movidos a `glutil.h`, públicos) bajaron de 800x480 a 720x432 --
+misma proporción 5:3 exacta (720/800 = 432/480 = 9/10), sin distorsión. `SCREEN_W`/`SCREEN_H`
+(reportados al motor, en `main.c`) **no se tocaron** -- siguen en 800x480, así que el menú no se ve
+afectado. Como el motor sigue pensando que la pantalla es 800x480, sus llamadas a `glViewport`/
+`glScissor` vienen expresadas en ese espacio; `glViewport_soloader`/`glScissor_soloader` (nuevos en
+`glutil.c`, resueltos en `dynlib.c` en vez de las funciones reales) las reescalan a 720x432 con
+aritmética entera "multiplicar antes de dividir" (nunca al revés) y clampean el resultado a los
+límites del FBO -- a diferencia del intento revertido del Bug #8, acá el framebuffer real (el FBO)
+SÍ mide exactamente 720x432, no hay mismatch de tamaño entre superficie real y rect reescalado (la
+causa sospechada de aquel GPU crash). `source/video.cpp`'s `VIDEO_TARGET_W/H` (Bug #13) ahora son
+alias de `OFFSCREEN_W/H` en vez de una copia hardcodeada en 800/480, para que el video (que dibuja en
+el mismo FBO) no vuelva a quedar recortado si este valor cambia de nuevo a futuro.
+
+Píxeles reales a rasterizar/sombrear por frame: 960x544 (nativo) -> 800x480 (Bug #10, -26%) -> 720x432
+(esta sesión, -19% adicional sobre 800x480, -40% total sobre nativo).
+
+### Verificado, sin cambios de código -- PVRTC
+
+Se pidió confirmar que las texturas comprimidas PVRTC (`mbUsePVRT=1`, ver `main.c`) realmente llegan a
+la GPU comprimidas y no caen a RGBA sin comprimir. Confirmado en `source/dynlib.c`: `glCompressedTexImage2D`
+está resuelto contra la función real de vitaGL (no un stub/no-op) -- el único otro símbolo relacionado,
+`glCompressedTexSubImage2D`, es un no-op (`ret0`) pero el `.so` no lo importa en absoluto (no
+confirmado que el motor dependa de actualizaciones parciales de texturas comprimidas). No se encontró
+ningún bug ni cambio necesario acá.
+
+### No implementado -- memoización de chunks LZMA ya descomprimidos
+
+Investigado en el pseudo-C de Ghidra (`decompiled/libasphalt5_armeabi/ghidra/out_ghidra.c`):
+`CGamePackage::GetLZMAFile(int)` no descomprime nada directamente -- llama `SetActiveLib`,
+`CPackage::FSeekLibData`, `CPackage::InitCompressedFile` y devuelve un puntero desde un array interno
+de objetos `LZMAFile*` ya existentes (`CGamePackage` tiene 14 sub-objetos `CPackage`, cada uno con su
+propio estado). No se pudo confirmar sin más reversing si `InitCompressedFile`/`OpenAttached` vuelven
+a descomprimir el chunk entero en cada llamada repetida (la premisa del Bug #9 "sin investigar") o si
+ya reusan el objeto persistente -- y un hook a ciegas sobre offsets de esta estructura (14 sub-objetos,
+arrays indexados) tiene un riesgo real de corromper memoria del motor (la misma clase de bug que ya
+causó corrupción de geometría/GPU crashes en el Bug #18/#19), a diferencia de los hooks de
+`CMatrix::Mult` (Bug #6), que reemplazan una función matemática pura y autocontenida. Se descartó
+implementarlo como parche a ciegas; si se quiere retomar, hace falta primero confirmar en consola real
+(con profiling, no adivinando) si el costo sigue siendo CPU-bound tras el fix de `RES_POOL_SLOTS`.
+
+**Build:** compilado con `psvita-toolkit build` contra el VITASDK real -- `cmake`/`make` sin errores,
+`asphalt5.vpk` generado (2.2MB). No desplegado a la consola en esta sesión.
