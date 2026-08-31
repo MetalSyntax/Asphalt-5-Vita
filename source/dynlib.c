@@ -717,7 +717,7 @@ so_default_dynlib default_dynlib[] = {
         { "glTexGenivOES", (uintptr_t)&ret0 },
         { "glTexGenxOES", (uintptr_t)&ret0 },
         { "glTexGenxvOES", (uintptr_t)&ret0 },
-        { "glTexImage2D", (uintptr_t)&glTexImage2D },
+        { "glTexImage2D", (uintptr_t)&glTexImage2D_soloader },
         { "glTexParameterf", (uintptr_t)&glTexParameterf },
         { "glTexParameterfv", (uintptr_t)&ret0 },
         { "glTexParameteri", (uintptr_t)&glTexParameteri },

@@ -320,6 +320,47 @@ void glCopyTexSubImage2D_soloader(GLenum target, GLint level, GLint xoffset, GLi
     // No-op to avoid slow CPU readbacks
 }
 
+/*
+ * Confirmed root cause of the "GPU collapse" in port_progress.md (perf
+ * telemetry: Scene::Render() taking 488ms then 3.5s; the matching
+ * .psp2dmp's PC/backtrace is NOT a real fault -- "Razón de parada: No
+ * reason" -- it's a forced dump of a thread stuck inside vitaGL's own
+ * morton_1()/dxt_compress()/_glDrawElements_FixedFunctionIMPL, per
+ * upstream vitaGL source, source/utils/gpu_utils.c and source/textures.c):
+ * glTexImage2D() with an S3TC/DXT internalformat and *uncompressed* pixel
+ * data leaves vitaGL's `tex->write_cb` NULL, which routes the upload
+ * through gpu_alloc_compressed_texture(..., uncompressed=GL_TRUE) ->
+ * dxt_compress() -- a real, unbudgeted, synchronous per-4x4-block DXT
+ * encoder, run once per upload on whichever thread calls glTexImage2D.
+ * There is no hardware DXT encoder on the Vita's SGX543 for vitaGL to use
+ * instead; this cost is inherent to that codepath, not a bug to patch in
+ * vitaGL itself. The game's texture assets are otherwise PVRTC (mbUsePVRT,
+ * main.c) via glCompressedTexImage2D, which is untouched by this and
+ * already takes the fast native-copy path -- this only catches a
+ * glTexImage2D call (uncompressed source, e.g. a render-to-texture result)
+ * that asks for DXT storage specifically. Remapping to GL_RGBA keeps the
+ * same source data valid (the caller already handed raw RGBA/whatever
+ * `format`/`type` describe) and costs a few KB of extra VRAM on that one
+ * texture in exchange for never hitting the compressor at all.
+ */
+void glTexImage2D_soloader(GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLint border, GLenum format, GLenum type, const void *pixels) {
+    switch (internalformat) {
+        case GL_COMPRESSED_RGB_S3TC_DXT1_EXT:
+        case GL_COMPRESSED_RGBA_S3TC_DXT1_EXT:
+        case GL_COMPRESSED_RGBA_S3TC_DXT5_EXT:
+        case GL_COMPRESSED_SRGB_S3TC_DXT1:
+        case GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT1:
+        case GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT5:
+        case GL_COMPRESSED_SRGB:
+        case GL_COMPRESSED_SRGB_ALPHA:
+            internalformat = GL_RGBA;
+            break;
+        default:
+            break;
+    }
+    glTexImage2D(target, level, internalformat, width, height, border, format, type, pixels);
+}
+
 void glShaderSource_soloader(GLuint shader, GLsizei count,
                              const GLchar **string, const GLint *_length) {
 #ifdef DEBUG_OPENGL
