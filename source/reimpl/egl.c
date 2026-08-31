@@ -12,6 +12,7 @@
 
 #include <string.h>
 #include <stdlib.h>
+#include <psp2/rtc.h>
 
 EGLBoolean eglInitialize(EGLDisplay dpy, EGLint *major, EGLint *minor) {
     l_debug("eglInitialize(0x%x)", (int)dpy);
@@ -344,4 +345,59 @@ EGLBoolean eglGetConfigs(EGLDisplay display, EGLConfig * configs,
     *num_config = 1;
 
     return EGL_TRUE;
+}
+
+/*
+ * These 5 were previously satisfied by vitaGL's own source/egl.c, unused
+ * before vitaGL was built from source (see CMakeLists.txt) rather than
+ * linked as a prebuilt package -- linking both this file's egl.c and
+ * vitaGL's own is a duplicate-symbol error for every function they share
+ * (eglInitialize, eglQueryContext, ...), so vitaGL's copy was dropped from
+ * the vendored lib/vitagl checkout, and these 5 (the only ones this file
+ * didn't already have) are added here instead. Behavior matches vitaGL's
+ * own implementation of each (see lib/vitagl/source/egl.c in git history).
+ */
+EGLBoolean eglBindAPI(EGLenum api) {
+    return EGL_TRUE;
+}
+
+EGLDisplay eglGetDisplay(NativeDisplayType native_display) {
+    if (native_display == EGL_DEFAULT_DISPLAY) {
+        return strdup("display");
+    }
+    return EGL_NO_DISPLAY;
+}
+
+EGLint eglGetError(void) {
+    return EGL_SUCCESS;
+}
+
+void (*eglGetProcAddress(char const *procname))(void) {
+    return vglGetProcAddress(procname);
+}
+
+EGLBoolean eglSwapBuffers(EGLDisplay display, EGLSurface surface) {
+    gl_swap();
+    return EGL_TRUE;
+}
+
+// Only reachable through vglGetProcAddress()'s lookup table (lib/vitagl's
+// source/lookup.c), never called by this game directly -- vsync_interval
+// isn't tracked anywhere in this file's other stubs either.
+EGLBoolean eglSwapInterval(EGLDisplay display, EGLint interval) {
+    return EGL_TRUE;
+}
+
+EGLenum eglQueryAPI(void) {
+    return EGL_OPENGL_ES_API;
+}
+
+EGLuint64 eglGetSystemTimeFrequencyNV(void) {
+    return (EGLuint64) sceRtcGetTickResolution();
+}
+
+EGLuint64 eglGetSystemTimeNV(void) {
+    SceRtcTick t;
+    sceRtcGetCurrentTick(&t);
+    return t.tick;
 }

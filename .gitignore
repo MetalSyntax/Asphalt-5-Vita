@@ -28,7 +28,11 @@ assets/
 /build/
 CMakeCache.txt
 CMakeFiles/
-Makefile
+# Anchored to the repo root: an unanchored "Makefile" here would also match
+# (and, via the toolkit's build-time rsync --filter=":- .gitignore", strip)
+# lib/vitagl/Makefile -- a real, hand-written source file of the vendored
+# vitaGL submodule, not a generated artifact.
+/Makefile
 cmake_install.cmake
 *.elf
 *.self
@@ -59,3 +63,4 @@ asphalt5/
 *.jpg
 source_with_video
 *.bak
+decompiled

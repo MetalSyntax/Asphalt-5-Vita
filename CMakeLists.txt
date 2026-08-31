@@ -55,6 +55,17 @@ if (NOT NETLOG_IP STREQUAL "")
 endif()
 add_definitions(-DNETLOG_DEFAULT_PORT=${NETLOG_PORT})
 
+# Streams FRAME/GPU/PHASE_ENTER/PHASE_EXIT/VGLPOOL lines over the netlog UDP
+# sink (see NETLOG_IP above) to localize exactly which engine phase or GPU
+# stall causes a frame collapse / the Bug #19-#22 vertex-pool GPU crash. Adds
+# real overhead (sceGxmFinish forces a pipeline stall; the Scene:: phase hooks
+# repatch/unpatch the .so's own code on every call) -- turn this OFF again
+# once the current in-race collapse is diagnosed, don't ship it ON.
+option(ENABLE_PERF_TELEMETRY "Stream frame/GPU/engine-phase timing over the netlog UDP sink (profiling builds only)" ON)
+if (ENABLE_PERF_TELEMETRY)
+  add_definitions(-DENABLE_PERF_TELEMETRY)
+endif()
+
 set(SHADER_FORMAT "GLSL" CACHE STRING "Preferred shader format (one of 'GLSL', 'CG', 'GXP')")
 if (${SHADER_FORMAT} STREQUAL "GLSL")
   add_definitions(-DUSE_GLSL_SHADERS)
@@ -82,6 +93,19 @@ if (CMAKE_BUILD_TYPE STREQUAL "Debug")
   # Uncomment this for verbose FalsoJNI logging:
   #add_definitions(-DFALSOJNI_DEBUGLEVEL=0)
 endif()
+
+# Space-separated flags passed to vitaGL's own Makefile (built from source,
+# see the vitaGL_build target below -- not the vdpm prebuilt package).
+# DRAW_SPEEDHACK=2 (-DSAFER_DRAW_SPEEDHACK, threshold 0x8000) is the fix for
+# Bug #19/#20/#22: the generic vdpm vitaGL always copies every vertex
+# attribute stream into its small circular temp pool before a draw
+# (gpu_alloc_mapped_temp in ffp.c's _glDrawElements_FixedFunctionIMPL) --
+# large draws (car meshes, multi-pass track geometry) are exactly what
+# exhausts/corrupts that pool. With this flag, any stream over 32KB skips the
+# temp-pool copy entirely and reads straight from the game's own vertex data.
+# Matches the exact flag set asphalt8-vita-main uses successfully with a much
+# heavier game on the same vitaGL/vitasdk combination.
+set(VITAGL_MAKE_FLAGS "SOFTFP_ABI=1 NO_DEBUG=1 HAVE_SHADER_CACHE=1 NO_SPLASHSCREEN=1 DRAW_SPEEDHACK=2")
 
 # makes sincos, sincosf, etc. visible
 add_definitions(-D_GNU_SOURCE -D__POSIX_VISIBLE=999999)
@@ -111,6 +135,7 @@ add_executable(${CMAKE_PROJECT_NAME}
                source/reimpl/time64.c
                source/reimpl/asset_manager.cpp
                source/video.cpp
+               source/perf_telemetry_hooks.c
                source/utils/dialog.c
                source/utils/glutil.c
                source/utils/init.c
@@ -128,6 +153,42 @@ add_executable(${CMAKE_PROJECT_NAME}
 
 add_subdirectory(lib/libc_bridge)
 add_dependencies(${CMAKE_PROJECT_NAME} SceLibcBridge)
+
+# VitaGL built from lib/vitagl (git submodule) via its own Makefile, instead
+# of linking the generic vdpm-installed prebuilt package -- so VITAGL_MAKE_FLAGS
+# above (DRAW_SPEEDHACK=2 in particular) actually takes effect. Also makes
+# testing further vitaGL build-flag changes fast without touching vitasdk itself.
+separate_arguments(VITAGL_MAKE_ARGS UNIX_COMMAND "${VITAGL_MAKE_FLAGS}")
+
+set(VITAGL_DIR ${CMAKE_SOURCE_DIR}/lib/vitagl)
+set(VITAGL_LIB ${VITAGL_DIR}/libvitaGL.a)
+
+# Force a full rebuild of vitaGL whenever VITAGL_MAKE_FLAGS change
+set(VITAGL_FLAGS_STAMP ${CMAKE_BINARY_DIR}/vitagl_flags.stamp)
+set(vitagl_old_flags "")
+if (EXISTS ${VITAGL_FLAGS_STAMP})
+  file(READ ${VITAGL_FLAGS_STAMP} vitagl_old_flags)
+endif()
+if (NOT vitagl_old_flags STREQUAL VITAGL_MAKE_FLAGS)
+  file(GLOB_RECURSE vitagl_stale_objs ${VITAGL_DIR}/source/*.o)
+  file(REMOVE ${vitagl_stale_objs} ${VITAGL_LIB})
+  file(WRITE ${VITAGL_FLAGS_STAMP} "${VITAGL_MAKE_FLAGS}")
+endif()
+
+# Keep VitaGL builds deterministic and within the port's low-memory budget.
+set(VITAGL_NPROC 1)
+
+add_custom_target(vitaGL_build
+                  COMMAND make -C ${VITAGL_DIR} -j${VITAGL_NPROC} ${VITAGL_MAKE_ARGS}
+                  BYPRODUCTS ${VITAGL_LIB}
+                  COMMENT "Building VitaGL"
+                  VERBATIM)
+
+add_library(vitaGL STATIC IMPORTED)
+set_target_properties(vitaGL PROPERTIES
+                      IMPORTED_LOCATION ${VITAGL_LIB}
+                      INTERFACE_INCLUDE_DIRECTORIES ${VITAGL_DIR}/source)
+add_dependencies(${CMAKE_PROJECT_NAME} vitaGL_build)
 
 target_include_directories(${CMAKE_PROJECT_NAME} SYSTEM
                            PUBLIC ${CMAKE_SOURCE_DIR}/lib

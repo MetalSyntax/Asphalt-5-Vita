@@ -1651,3 +1651,254 @@ implementarlo como parche a ciegas; si se quiere retomar, hace falta primero con
 
 **Build:** compilado con `psvita-toolkit build` contra el VITASDK real -- `cmake`/`make` sin errores,
 `asphalt5.vpk` generado (2.2MB). No desplegado a la consola en esta sesión.
+
+## Sesión de análisis de motor + telemetría (2026-08-31)
+
+Se pidió un dump ARM del `.so` para conocer las funciones del motor y, a partir de ahí, instrumentar
+la consola para capturar en tiempo real cuál función colapsa la GPU.
+
+### Dump ARM completo del motor
+
+`decompiled/libasphalt5_armeabi/` (gitignorado, regenerable) ahora también tiene, generados con
+`arm-vita-eabi-objdump`/`nm` del propio VITASDK (el toolkit no tiene un subcomando de disassembly
+genérico, `analyze` es específico para `.psp2dmp`):
+- `libasphalt5_disasm.txt` -- disassembly ARM/Thumb completo, nombres C++ desmangled.
+- `libasphalt5_symbols_by_addr.txt` / `libasphalt5_symbols_by_size.txt` -- 6887 símbolos.
+
+Se cruzó contra el pseudo-C de Ghidra ya existente (`ghidra/out_ghidra.c`, 5186 funciones) para leer
+`Scene::UpdateCars()` y el arranque de `CCar::UpdateBeforeCollisions()`/`UpdateAIBeforeCollisions()`
+(las funciones de motor más grandes según el dump por tamaño). Conclusión: no hay soft-float emulado
+(sólo `__aeabi_idiv`/`__aeabi_uidiv`, inherentes al target ARM, no una regresión de Vita), no hay loop
+O(n²) visible sobre `CMultiArray<CCar*>` a este nivel, y esta lógica corría igual en el hardware
+Android original (mucho más débil) -- parchearla a ciegas tiene el mismo riesgo que ya se descartó
+para la memoización de LZMA arriba. Se decidió no tocar esta lógica y en cambio medir en consola real.
+
+### Instrumentación agregada (opt-in, `ENABLE_PERF_TELEMETRY`, ON por defecto en esta sesión)
+
+Generado con `psvita-toolkit perf-telemetry --gen-hooks` / `mem-profile --gen-hooks` / `soak-test
+--gen-hooks`, pero el código autogenerado abría su propio socket BSD (`<sys/socket.h>`) y asumía
+firmas de API que no coinciden con este VITASDK -- confirmado por el propio compilador:
+`sceKernelGetProcessTimeWide()` no toma un puntero (devuelve `SceUInt64` directo, a diferencia de
+`sceKernelGetProcessTime(SceKernelSysClock*)`), y `sceKernelGetThreadRunStatus()` es por-hilo
+(`SceUID thid, ...`), no un snapshot global de 4 cores como asumía el generador -- por eso
+`perf_telemetry_sample_cores()` se descartó por completo en vez de adivinar la firma correcta.
+
+**`source/perf_telemetry_hooks.c/.h`** (nuevo, siempre compilado, llamadas gateadas por
+`ENABLE_PERF_TELEMETRY`): reescrito para reusar `netlog_send()` (el sink UDP que ya existe en
+`source/utils/netlog.c`, mismo `ux0:data/asphalt5/netlog.txt`) en vez de un segundo socket propio.
+Expone `perf_telemetry_frame_begin/end()` (tiempo de un frame completo), `perf_telemetry_
+gpu_sync_and_measure()` (fuerza `sceGxmFinish`, sólo para uso puntual), y `perf_telemetry_vgl_pool_
+sample()` -- lee `vglMemFree(VGL_MEM_RAM)`/`vglMemTotal(VGL_MEM_RAM)`, el mismo pool de 12MB fijado
+en `gl_init()` que revienta en los crashes de GPU de los Bugs #19/#20/#22 -- para ver ese pool
+acercándose a 0 en tiempo real, antes del crash. Cableado en `source/main.c`: `frame_begin()` antes de
+`Renderer_nativeRender()`, `frame_end()` + `vgl_pool_sample()` después de `gl_swap()`.
+
+**`source/patch.c`**: 4 hooks nuevos vía `hook_addr()`/`SO_CONTINUE` (mismo mecanismo que `CMatrix::
+Mult` del Bug #6 -- restaura las 2 instrucciones originales, llama la función real sin modificarla,
+re-aplica el hook) sobre `Scene::Update()`, `Scene::UpdateCars()`, `Scene::Render()`, `Scene::
+RenderInterface()` (las 4 fases de más alto nivel por frame, confirmadas en el pseudo-C -- todas
+`(this)` sin otros parámetros). Cada una emite `PHASE_ENTER,<nombre>` antes de llamar a la función
+real y `PHASE_EXIT,<nombre>,<microsegundos>` después. Si la consola crashea a mitad de una fase, el
+receptor UDP (`nc -u -l 18194`) va a mostrar el `PHASE_ENTER` sin su `PHASE_EXIT` correspondiente --
+esa es la fase que colapsó la GPU, sin necesidad de un `.psp2dmp`.
+
+`mem_profiler_hooks.c/.h` (wrappers de `malloc`/`calloc`/`realloc`/`free`) y `monkey_test_hooks.c/.h`
+(heartbeat + input fuzzing para soak-test desatendido) también se generaron pero **no se cablearon**
+-- el primero requiere reemplazar las 4 entradas de libc en la tabla de imports de `dynlib.c`, lo que
+mandaría un paquete UDP por cada allocation del motor (volumen alto, no justificado todavía porque el
+mecanismo de colapso ya confirmado -- Bug #19/#20/#22 -- es el pool fijo de vitaGL, no un leak de
+heap general); el segundo cambia el input real y no aporta a este diagnóstico puntual. Quedan
+disponibles si hace falta cazar un leak de heap o correr un soak-test desatendido más adelante.
+
+**Build:** `psvita-toolkit build --preset release` con `ENABLE_PERF_TELEMETRY=ON` -- compila limpio
+contra el VITASDK real, `asphalt5.vpk` generado. Desplegado y probado en consola real (ver abajo).
+
+### Primera corrida en consola -- 3 bugs propios en la instrumentación, corregidos
+
+Primer intento con la instrumentación de arriba: `FRAME,<µs>` y `VGLPOOL,zu,zu` (sic) llegaron por UDP,
+pero **ninguna línea `PHASE_ENTER`/`PHASE_EXIT` apareció nunca**, y todo el stream llegó concatenado en
+una sola línea sin separadores. Tres bugs propios de esta sesión, no del motor:
+
+1. **Los 4 hooks de `Scene::` quedaron definidos pero nunca instalados.** `hook_Scene_Update`/
+   `_UpdateCars`/`_Render`/`_RenderInterface` y sus `so_hook` estáticos se escribieron en `patch.c`,
+   pero se olvidaron las llamadas `hook_addr()` dentro de `so_patch()` -- las 4 funciones del motor
+   corrieron sin ningún hook instalado, por eso cero telemetría de fase. Corregido: las 4 llamadas
+   `hook_addr()` que faltaban ahora están al final de `so_patch()`, bajo `#ifdef ENABLE_PERF_TELEMETRY`.
+2. **`VGLPOOL` usaba `%zu`**, que el `printf`/`snprintf` de este VITASDK no soporta (imprime el
+   conversor literal `zu` en vez del número, sin ningún error de compilación). Corregido: cast a
+   `unsigned long long` + `%llu`, igual que ya hacían `FRAME`/`GPU`.
+3. **Ningún mensaje llevaba `\n`.** `logger.c` sí le agrega `\n` a cada línea antes de mandarla por
+   netlog (por eso los logs `[INFO]` se ven bien) pero `pt_send()` no lo hacía, así que `nc -u -l`
+   mostraba todo el stream pegado en una sola línea larga. Corregido en `pt_send()`.
+
+Reconstruido y confirmado con `psvita-toolkit build --preset release` (compila limpio). Redesplegado.
+
+### Hallazgo preliminar (sin confirmar todavía, necesita la corrida con los 3 bugs ya arreglados)
+
+En esa misma primera corrida, antes de detectar los 3 bugs de arriba, varios `FRAME` se dispararon a
+valores enormes -- 206299, 258246, 288436, y luego una racha de 1.26-2.65 **millones** de µs (hasta
+2.65 **segundos** por frame) -- coincidiendo en el stream con líneas `[audio] loaded ux0:data/
+asphalt5/data/raw_009.glsnd` / `raw_155.glsnd`. La proximidad temporal es sugerente pero **no prueba
+causalidad**: `audio.cpp` ya mueve la decodificación de sonidos a `loader_thread` (prioridad 0x7F,
+afinidad `SCE_KERNEL_CPU_MASK_USER_2`, separado del `audio_mixer` en `SCE_KERNEL_CPU_MASK_USER_1`) y
+`sfx_get()` devuelve `NULL` inmediatamente en vez de bloquear al llamador -- el freeze síncrono de 4+
+segundos que describe el comentario de esa función ya se documentó y arregló en una sesión anterior.
+Sin los `PHASE_ENTER`/`PHASE_EXIT` (bug #1 de arriba) no hay forma de saber si esos FRAME gigantes
+pasaron dentro de `Scene::Render`/`RenderInterface` (consistente con GPU/vertex-pool, Bug #19/#20/#22)
+o en otro lado -- coincidencia de logging entre hilos distintos escribiendo al mismo socket no es lo
+mismo que una relación causal. **Pendiente:** repetir la corrida con la instrumentación ya corregida.
+
+### Segunda corrida -- `Scene::Render()` confirmado como la fase que colapsa, `RenderInterface` descartado
+
+Con los hooks de `Scene::` ya instalados (bug #1 arriba corregido), la segunda corrida en consola real
+mostró:
+
+- `Scene::Update()`/`Scene::UpdateCars()`: consistentemente **500-1800us**, en decenas de frames
+  seguidos -- confirma lo que ya se había concluido leyendo el pseudo-C a mano (sesión anterior): la
+  física/IA por auto NO es el cuello de botella.
+- `Scene::Update()`/`UpdateCars()` NO corren todos los frames por igual -- se ven rachas de ~12 pares
+  seguidos sin ningún `Scene::Render` de por medio (tick lógico desacoplado del render, ver
+  `Scene::ChangeLogicalFPS`/`UpdateCarsConstFPS`/`UpdateCarsInSlowMotion` en el pseudo-C) -- esperado,
+  no es un bug.
+- `Scene::Render()`: **488352us (488ms)** la primera vez, y **3516843us (3.5 SEGUNDOS)** la segunda,
+  coincidiendo esta última con un crash de GPU confirmado por el usuario en consola.
+- `Scene::RenderInterface()`, anidado DENTRO de `Scene::Render()`: **11-15us** las dos veces --
+  **descartado** como sospechoso. El costo entero de esos 488ms/3.5s está en alguna otra parte de
+  `Scene::Render()`, no en el overlay de UI.
+- `VGLPOOL` seguía roto (`zu,zu`) en esta corrida -- el fix de la sesión anterior nunca se aplicó de
+  verdad (quedó sólo escrito en las notas, no en el código -- confirmado y corregido ahora sí, cast a
+  `unsigned long long` + `%llu`).
+
+**Hooks nuevos agregados** (mismo mecanismo `hook_addr`/`SO_CONTINUE`, en `source/patch.c`), para
+subdividir qué hace `Scene::Render()` internamente (`decompiled/.../ghidra/out_ghidra.c:46136` lista
+~15 sub-funciones de render; se priorizaron las 2 candidatas más pesadas en volumen de geometría):
+- `gxRenderGroup::RenderGroups(int, bool)` -- geometría de pista/carretera, invocada **~5 veces por
+  frame** dentro de `Render()` (pasada opaca, blend de reflejo, add de reflejo, grupo transparente) --
+  la más probable de tocar el pool de vértices de vitaGL (Bug #19/#20/#22) porque es la que más
+  geometría manda a la GPU por frame.
+- `Scene::RenderCars(uchar)` -- mallas de los autos, el otro gran emisor de geometría.
+
+**Build:** recompilado limpio con `psvita-toolkit build --preset release`. **Pendiente:** desplegar
+(la consola no respondió FTP en 2 intentos -- necesita VitaShell abierto + SELECT) y repetir la
+carrera hasta el próximo colapso. Si el tiempo se concentra en `gxRenderGroup::RenderGroups` y/o
+`Scene::RenderCars`, y `VGLPOOL` cae a 0 antes del crash, confirma sin ambigüedad el mecanismo de
+Bug #19/#20/#22 (agotamiento del pool de 12MB) como causa del colapso actual, no algo nuevo.
+
+### Bug #23 -- CONFIRMADO Y CORREGIDO: el "GPU crash" del `.psp2dmp` no era un fault -- era `dxt_compress()` de vitaGL bloqueando el hilo por hasta 3.5s
+
+El usuario pidió corregir el crash antes de seguir instrumentando y compartió el dump real:
+`logs/asphalt5-psp2core-1788151414-GPUCRASH.psp2dmp.analysis.txt`.
+
+**Primera sorpresa: no es un fault.** `Razón de parada: 0x0 (No reason (ejecución normal))` -- a
+diferencia de los Bugs #19/#20/#22 (data abort real por agotar el pool de vértices), este dump es un
+snapshot forzado de un hilo que está corriendo *normalmente*, sólo que muy lento. El backtrace
+(`_glDrawElements_FixedFunctionIMPL` en `vitaGL/source/ffp.c:1540`, `morton_1` en
+`vitaGL/source/utils/gpu_utils.c:50`) apunta 100% adentro de vitaGL, no del `.so` del juego.
+
+**Causa raíz, confirmada leyendo el código fuente real de vitaGL** (clonado de
+github.com/Rinnegatamante/vitaGL a `scratchpad/vitaGL` para esta sesión, no adivinado): `morton_1` es
+una función trivial de 6 instrucciones (bit-interleaving), pero sólo se usa dentro de
+`dxt_compress()` -- un compresor DXT/S3TC real, por bloques de 4x4 píxeles, sin presupuesto de tiempo
+ni asincronía. `dxt_compress()` se dispara desde `gpu_alloc_compressed_texture()` únicamente cuando
+`tex->write_cb == NULL`, y eso sólo pasa (confirmado leyendo `textures.c`, línea por línea) para un
+`glTexImage2D()` (no `glCompressedTexImage2D`) llamado con `internalformat` en
+`GL_COMPRESSED_*_S3TC_DXT1/DXT5` y datos de píxel **sin comprimir** -- vitaGL no tiene un encoder DXT
+por hardware en el SGX543 de la Vita, así que comprime por software, sincrónicamente, en el hilo que
+llamó `glTexImage2D`. Un solo upload así explica los 488ms/3.5s medidos por la telemetría de fase de
+esta sesión en `Scene::Render()`.
+
+Los assets normales del juego van por PVRTC (`mbUsePVRT`, `main.c`) vía `glCompressedTexImage2D`, que
+usa la rama rápida de copia nativa y **no toca este código** -- este bug sólo se dispara para alguna
+textura puntual (candidato: `Scene::RenderToTexture()`, ver símbolos en el dump ARM) que el motor sube
+sin comprimir pero pidiendo almacenamiento DXT específicamente.
+
+**Fix:** `source/utils/glutil.c`/`.h` -- `glTexImage2D_soloader()` (nuevo) intercepta el
+`internalformat` antes de reenviar a la función real: si es cualquiera de los 8
+`GL_COMPRESSED_*_S3TC_DXT1/DXT5`/`GL_COMPRESSED_SRGB(_ALPHA)`, lo reemplaza por `GL_RGBA` (los datos
+de entrada ya eran píxeles sin comprimir, así que el reemplazo es válido bit a bit) antes de llamar a
+`glTexImage2D` real -- unos KB más de VRAM en esa textura puntual a cambio de nunca entrar al
+compresor. `source/dynlib.c` resuelve `"glTexImage2D"` contra este wrapper en vez de la función real
+directamente (mismo patrón que `glCopyTexImage2D_soloader`/`glEnable_soloader` ya establecido en este
+archivo). No se tocó `glCompressedTexImage2D` (ya confirmado en sesión anterior que usa la rama
+rápida, sin relación con este bug).
+
+**Build:** compilado limpio con `psvita-toolkit build --preset release`. **Pendiente:** desplegar
+(consola sin responder FTP) y confirmar en consola real que el colapso no vuelve a aparecer.
+
+### Pregunta del usuario -- ¿sirven los módulos PVR_PSP2 de `Dungeon-Hunter-2-vita/module/` acá, o son sólo para ARMv7?
+
+Investigado: esos `.suprx` (`libIMGEGL`, `libGLESv1_CM`, `libGLESv2`, `libgpu_es4_ext`, `libpvr2d`,
+`libpvrPSP2_WSEGL`) son el driver PowerVR SGX **real** (proyecto open-source
+[GrapheneCt/PVR_PSP2](https://github.com/GrapheneCt/PVR_PSP2)) que Dungeon Hunter 2 usa en vez de
+vitaGL -- no una reimplementación desde cero como vitaGL, sino el driver original de Imagination
+Technologies re-portado a la Vita. Corren como módulos `.suprx` separados del propio `.so` del juego,
+hablando con él sólo vía la API C estándar de EGL/GLES -- **no dependen de si el `.so` del juego es
+armeabi (ARMv6) o armeabi-v7a**, esa restricción no existe. `libGLESv1_CM.suprx` cubre exactamente el
+pipeline fixed-function GLES 1.1 que usa `libasphalt5.so`.
+
+Dicho esto, **no es un swap simple**: el propio `PORTING_PLAN.md` de Dungeon Hunter 2 documenta 3+ días
+de debugging sólo para que `eglGetDisplay` devolviera éxito (rutas de carga internas hardcodeadas por
+Sony/Imagination en los `.suprx`, orden de precarga de módulos, etc.) -- y significaría descartar toda
+la infraestructura ya construida sobre la API específica de vitaGL en este proyecto (el downsample FBO
+de `OFFSCREEN_W/H`, `vglInitExtended` con resolución custom, los wrappers `_soloader` de estado GL).
+Sería el fix **definitivo** para toda la familia de bugs específicos de la reimplementación de vitaGL
+(Bug #19/#20/#22 y este Bug #23), porque el driver real no tiene un pool de vértices de 12MB inventado
+ni un compresor DXT por software -- pero es una re-arquitectura de varios días, no una tarde. Con el
+Bug #23 recién confirmado y corregido con un cambio de una función, tiene más sentido probar esto en
+consola primero antes de decidir si vale la pena el salto a PVR_PSP2.
+
+## Vendorizado vitaGL desde fuente con `DRAW_SPEEDHACK=2` (2026-08-31)
+
+El usuario pidió implementar lo investigado en `asphalt8-vita-main`: compilar vitaGL desde su propio
+código fuente (en vez de linkear el paquete precompilado de `vdpm`) con las mismas flags que usa ese
+port -- en particular `DRAW_SPEEDHACK=2` (`-DSAFER_DRAW_SPEEDHACK`), que en `ffp.c` hace que streams de
+vértices por encima de 32KB salten la copia al pool circular temporal y lean directo de la memoria del
+juego -- exactamente los draws grandes que revientan el pool en los Bugs #19/#20/#22.
+
+**Cambios de infraestructura:**
+- `lib/vitagl` agregado como submódulo git (`github.com/Rinnegatamante/vitaGL`), mismo patrón que
+  `lib/falso_jni` (ver `.gitmodules`).
+- `CMakeLists.txt`: `vitaGL` ya no se linkea como paquete de `vdpm` -- se compila desde
+  `lib/vitagl` vía su propio `Makefile` (`VITAGL_MAKE_FLAGS = "SOFTFP_ABI=1 NO_DEBUG=1
+  HAVE_SHADER_CACHE=1 NO_SPLASHSCREEN=1 DRAW_SPEEDHACK=2"`), con un stamp file para forzar
+  rebuild completo si las flags cambian (mismo mecanismo que `asphalt8-vita-main`).
+- `.gitignore`: la línea `Makefile` (sin anclar) borraba `lib/vitagl/Makefile` -- un archivo fuente
+  real del submódulo, no un artefacto -- del `rsync --filter=":- .gitignore"` que el toolkit usa para
+  copiar el proyecto a un directorio temporal antes de compilar (`_stage_in_tmp` en
+  `psvita_toolkit/build_deploy.py`). Corregido a `/Makefile` (anclado a la raíz).
+
+**3 incompatibilidades encontradas y corregidas al compilar el `master` actual de vitaGL contra el
+VITASDK instalado en este entorno** (parches locales pequeños y documentados en el propio submódulo,
+no en el vdpm/vitasdk compartido):
+
+1. **`SCE_GXM_INITIALIZE_FLAG_*`/`SCE_GXM_TEXTURE_FORMAT_ETC1_1BGR` no declarados** -- el
+   `psp2/gxm.h` instalado no tiene estas constantes (agregadas más tarde a `vitasdk/vita-headers`).
+   Shim `#ifndef`-guardado en `lib/vitagl/source/shared.h` con los valores exactos de
+   `vitasdk/vita-headers` -- se vuelve no-op solo si el VITASDK instalado algún día las define.
+2. **`lib/vitagl/source/egl.c` (la implementación EGL propia de vitaGL) colisiona con
+   `source/reimpl/egl.c`** (la nuestra, ya existente) -- ambas definen `eglInitialize` etc.,
+   "multiple definition" al linkear. Se eliminó `egl.c` del submódulo vendorizado (nuestro loader ya
+   tiene su propia capa EGL, más vieja y probada) y se portaron a `source/reimpl/egl.c` las 5
+   funciones que sólo existían en la de vitaGL y que nuestro `dynlib.c` sí resuelve
+   (`eglBindAPI`/`eglGetDisplay`/`eglGetError`/`eglGetProcAddress`/`eglSwapBuffers`), más 4 que sólo
+   hacían falta para que linkeara la tabla estática de `vglGetProcAddress` en `lookup.c`
+   (`eglSwapInterval`/`eglQueryAPI`/`eglGetSystemTimeFrequencyNV`/`eglGetSystemTimeNV`) -- mismo
+   comportamiento que la implementación original de vitaGL (revisada línea por línea, no adivinada).
+3. **`vglSetShaderAssociationPath()` (`vgl.c`) llama a `shark_set_shader_association_path()` sin
+   ningún `#ifdef` guard** (a diferencia de `vglSetShaderCachePath()`, la función de al lado, que sí
+   está guardada por `HAVE_SHADER_CACHE`) -- un símbolo de la librería de profiling Razor/devkit,
+   ausente en un toolchain de release. No la llamamos nunca; guardada localmente con
+   `#ifdef HAVE_RAZOR` (que no seteamos), igual que su vecina.
+
+**Build:** `psvita-toolkit build --preset release --clean` compila limpio de punta a punta contra el
+VITASDK real, `asphalt5.vpk` generado (2.3MB). **Pendiente:** desplegar y confirmar en consola que
+(a) el juego sigue arrancando/jugándose igual que antes (la capa EGL cambió de dónde vienen 9 de sus
+~20 funciones, aunque el comportamiento debería ser idéntico) y (b) si `DRAW_SPEEDHACK=2` mejora o
+elimina el colapso de `Scene::Render()`/GPU ya diagnosticado (Bug #23) y los de Bug #19/#20/#22.
+
+**Pendiente:** desplegar, crear `ux0:data/asphalt5/netlog.txt` con la IP de la PC (ver `extras/
+netlog.txt.sample`), correr `nc -u -l 18194` y jugar una carrera hasta el próximo colapso -- el log
+va a decir con certeza si es GPU-bound (VGLPOOL cayendo a 0 / FRAME alto con `Scene::Render` o
+`RenderInterface` como última fase sin EXIT) o si el tiempo se va en otra fase (`Update`/`UpdateCars`).
+Una vez diagnosticado, apagar `ENABLE_PERF_TELEMETRY` (no dejarlo ON en un build final -- fuerza
+`sceGxmFinish` y repatchea código en cada frame instrumentado).

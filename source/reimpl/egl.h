@@ -59,6 +59,24 @@ EGLBoolean eglGetConfigs(EGLDisplay display, EGLConfig * configs,
 
 char const * eglQueryString(EGLDisplay display, EGLint name);
 
+EGLBoolean eglBindAPI(EGLenum api);
+
+EGLDisplay eglGetDisplay(NativeDisplayType native_display);
+
+EGLint eglGetError(void);
+
+void (*eglGetProcAddress(char const *procname))(void);
+
+EGLBoolean eglSwapBuffers(EGLDisplay display, EGLSurface surface);
+
+EGLBoolean eglSwapInterval(EGLDisplay display, EGLint interval);
+
+EGLenum eglQueryAPI(void);
+
+EGLuint64 eglGetSystemTimeFrequencyNV(void);
+
+EGLuint64 eglGetSystemTimeNV(void);
+
 #define EGL_CONFIG_ID                     0x3028
 #define EGL_HEIGHT                        0x3056
 #define EGL_WIDTH                         0x3057
