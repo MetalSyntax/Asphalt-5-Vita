@@ -1939,3 +1939,31 @@ A pesar de los arreglos anteriores, la distorsión persistía. Una revisión exh
 **Fix:**
 - Se implementó completamente `GLMediaPlayer_setPitch`, agregando un multiplicador flotante `pitch` a `struct Voice`. Ahora, cuando el juego altera el pitch del sonido, se vuelve a calcular matemáticamente el avance fraccional (`step_int` / `step_frac`), permitiendo que el resampler mueva el audio más lento o rápido fluidamente. Esto soluciona los problemas de flanger/phasing.
 - Se agregó el código de seguridad (clamping) necesario a `GLMediaPlayer_setVolume` y `GLMediaPlayer_setVolumeBig` limitando tajantemente las entradas de volumen entre `0.0f` y `1.0f`.
+
+### Sesión log 059 -- CONFIRMADO CON PSEUDO-C: loops sin pitch/stop + música robada (audio), diagnóstico de input post-carrera
+
+Log `logs/asphalt5_059.log`: efectos ya audibles, pero (a) un sonido raro (motor), (b) sin música en carrera, (c) touch post-carrera aún dudoso + ruido estridente al terminar.
+
+**Audio -- causa raíz (disassembly + pseudo-C, no adivinado):**
+- `BaseSoundManager::playEx` real termina en `nativePlaySound(id,channel,vol)` o `nativePlaySoundBig(id,vol)` según flag `0x800000` del sonido (`out_ghidra.c:188517+`). Nuestro hook mandaba TODO a `audio_play_sound` one-shot: los loops largos (música 30-130s, ej. `raw_004` 108s visto en el log) caían en el pool de 16 voces y eran robados en segundos -> sin música. Los loops cortos (motor 2-3s) sonaban una vez y morían -> motor intermitente/raro.
+- `stop(iii)`/`stop(iiii)` eran `ret0`: los loops nunca se detenían (confirmado orden de params por disassembly: `mul soundId,24` stride + channel a `nativeStopSound`) -> el hum del motor seguía sonando tras la carrera = "ruido estridente como si se quedara pegado".
+- `setPitch`/`setVolume`/`stopSound` JNI filtraban por `(sndId,instance)` exacto, pero el hook guardaba `instance=0` mientras el motor usa su channel real -> todos esos updates se perdían (pitch congelado = motor "raro").
+
+**Fix (`audio.cpp`/`.h`, `patch.c`):** `audio_play_sound` ahora recibe `pitch+loop`; dedup sin reset de `pos` (re-fire ya no = stutter); robo prefiere one-shots; loops >15s van a `gBig` (réplica de la vía `nativePlaySoundBig`); `stop3/stop4` reales a `audio_stop_sound`; `voice_find` con fallback a solo-`sndId` en pause/resume/stop/vol/pitch; `setVolume` con rampa de 64 frames (anti-zipper).
+
+**Input:** el fix de slots del turno anterior ya va en este build (sin él ni compila). Como el reporte post-carrera es incierto ("creo"), se agregó logging `input: state A -> B` en cada transición + `input: touch press/release` por tap: el próximo log dirime si el tap llega al motor o si el estado post-carrera es otro.
+**Pendiente:** build + probar: (1) motor con pitch variable y sin drone tras la meta, (2) música en carrera, (3) log con líneas `input:` tras terminar una carrera.
+
+### Sesión log 059+ -- COMMIT: audio fiel al motor (loop/pitch/stop/música) + input post-carrera + docs
+
+**Audio (`source/audio.cpp`/`.h`, `source/patch.c`):**
+- `hook_BaseSoundManager_playEx` pasa `loop`+`pitch` al mixer (antes se descartaban: loops sonaban una vez y el motor quedaba en pitch base).
+- `audio_play_sound(sndId, instance, vol, pitch, loop)`: dedup sin reset de `pos` (re-fire ya no = stutter); robo prefiere one-shots; loops de >15s van a `gBig` (réplica de la vía `nativePlaySoundBig` del motor para música).
+- `stop(iii)`/`stop(iiii)` reales (params confirmados por disassembly: `soundId*24` stride, channel a `nativeStopSound`) -> los loops ya se detienen al terminar la carrera (antes drone eterno).
+- `voice_find()` con fallback a solo-`sndId` en pause/resume/stop/vol/pitch (el hook guarda `instance=1`, el motor usa su channel real; sin fallback todo se perdía).
+- `setVolume` con rampa de 64 frames (anti-zipper); `isSoundPlaying` real (los guards del motor vuelven a funcionar).
+- Evidencia: `playEx`/`stop`/`setPitch`/`setVolume` en `out_ghidra.c:188517+`, `42120+`, `67160+`, y `libasphalt5_disasm.txt:300069+`.
+
+**Input (`source/input.c`):** touches sintéticos por el allocator compartido (`FAKE_VITA_ID`, `poll_touch` los ignora); release total en cada cambio de estado (adiós dedos fantasma); CROSS en menús post-carrera manda tap al centro + DPAD_CENTER; logging `input: state A -> B` + `press/release` para diagnosticar con el próximo log.
+
+**Docs:** `README.md` (audio/input/known issues) y `RELEASE_BETA.md` actualizados a lo verificado en hardware (log 059).

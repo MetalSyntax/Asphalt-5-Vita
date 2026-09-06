@@ -12,7 +12,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifndef RES_PATH
 #define RES_PATH DATA_PATH "data/"
+#endif
 
 // --- JDA Pool (For returning byte arrays to the engine) ---
 #define RES_POOL_SLOTS 48

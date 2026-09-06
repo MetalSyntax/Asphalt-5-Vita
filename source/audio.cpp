@@ -412,23 +412,29 @@ static int mixer_thread(SceSize args, void *argp) {
         memset(accR, 0, sizeof(accR));
 
         pthread_mutex_lock(&gLock);
+        int active = 0;
+        if (gBig.smp && !gBig.paused) active++;
+        for (int v = 0; v < MAX_VOICES; v++) {
+            if (gVoices[v].smp && !gVoices[v].paused) active++;
+        }
         mix_voice(&gBig, accL, accR, MIX_GRAIN);
         for (int v = 0; v < MAX_VOICES; v++) {
             mix_voice(&gVoices[v], accL, accR, MIX_GRAIN);
         }
         pthread_mutex_unlock(&gLock);
 
+        // Gain compensation + soft limiter: two full-scale voices already
+        // exceed int16 even with the old 0.7 headroom. Scale by 1/sqrt(N)
+        // and soft-clip with tanh instead of hard-clipping to a square wave.
+        float comp = 0.703f / sqrtf(active > 1 ? (float) active : 1.0f);
         for (int i = 0; i < MIX_GRAIN; i++) {
-            // Apply a slight master headroom reduction (~0.7) to prevent hard clipping distortion
-            // when many voices play simultaneously.
-            int l = (accL[i] * 180) / 256;
-            int r = (accR[i] * 180) / 256;
-            
-            if (l > 32767) l = 32767; else if (l < -32768) l = -32768;
-            if (r > 32767) r = 32767; else if (r < -32768) r = -32768;
-            
-            outBuf[i * 2] = (short) l;
-            outBuf[i * 2 + 1] = (short) r;
+            float l = ((float) accL[i] * comp) / 32768.0f;
+            float r = ((float) accR[i] * comp) / 32768.0f;
+            l = tanhf(l);
+            r = tanhf(r);
+
+            outBuf[i * 2] = (short) (l * 32767.0f);
+            outBuf[i * 2 + 1] = (short) (r * 32767.0f);
         }
 
         sceAudioOutOutput(gPort, outBuf);
@@ -573,7 +579,23 @@ void GLMediaPlayer_loadSoundBig(jmethodID id, va_list args) {
     sfx_get(sndId);
 }
 
-void audio_play_sound(int sndId, int instance, float vol) {
+// Long looped tracks (music, 30-130s) don't belong in the 16-voice SFX
+// pool: they'd be stolen within seconds. Anything looped longer than
+// ~15s goes to the dedicated gBig voice instead.
+#define BIG_LOOP_FRAMES (22050 * 15)
+
+void audio_play_sound_big(int sndId, float vol, int loop);
+
+static void voice_set_step(Voice *v, int rate, float pitch) {
+    if (pitch < 0.25f) pitch = 0.25f;
+    if (pitch > 3.0f) pitch = 3.0f;
+    double step_d = ((double) rate / (double) MIX_RATE) * (double) pitch;
+    v->step_int = (unsigned int) step_d;
+    v->step_frac = (unsigned int) ((step_d - (double)v->step_int) * 4294967296.0);
+    v->pitch = pitch;
+}
+
+void audio_play_sound(int sndId, int instance, float vol, float pitch, int loop) {
     if (!gAudioReady) return;
 
     SfxSample *s = sfx_get(sndId);
@@ -582,23 +604,52 @@ void audio_play_sound(int sndId, int instance, float vol) {
     if (vol < 0.0f) vol = 0.0f;
     if (vol > 1.0f) vol = 1.0f;
 
+    // Music/long ambient loops get their own unstolen voice (mirrors the
+    // engine's own nativePlaySoundBig path for 0x800000-flagged sounds).
+    if (loop && s->frames > BIG_LOOP_FRAMES) {
+        audio_play_sound_big(sndId, vol, loop);
+        return;
+    }
+
     pthread_mutex_lock(&gLock);
+    // Dedup: SampleStartIfNotPlaying-style callers re-fire while the sound
+    // is already live. Refresh vol/pitch/loop but do NOT reset pos -- a
+    // restart on every re-fire is a stutter/buzz at the re-fire rate.
+    for (int i = 0; i < MAX_VOICES; i++) {
+        if (gVoices[i].smp && gVoices[i].sndId == sndId && !gVoices[i].paused) {
+            Voice *e = &gVoices[i];
+            voice_set_step(e, s->rate, pitch > 0.0f ? pitch : 1.0f);
+            e->targetGain = vol;
+            e->loop = loop ? true : false;
+            e->instance = instance;
+            pthread_mutex_unlock(&gLock);
+            return;
+        }
+    }
     Voice *v = NULL;
     for (int i = 0; i < MAX_VOICES; i++) {
         if (!gVoices[i].smp) { v = &gVoices[i]; break; }
     }
-    if (!v) v = &gVoices[0]; // steal oldest
+    if (!v) {
+        // Prefer stealing a one-shot over killing a loop (engine hum,
+        // skids); only steal a loop if all 16 are loops.
+        for (int i = 0; i < MAX_VOICES; i++) {
+            if (!gVoices[i].loop) { v = &gVoices[i]; break; }
+        }
+        if (!v) v = &gVoices[0];
+    }
 
-    double step_d = (double) s->rate / (double) MIX_RATE;
-    v->step_int = (unsigned int) step_d;
-    v->step_frac = (unsigned int) ((step_d - (double)v->step_int) * 4294967296.0);
+    voice_set_step(v, s->rate, pitch > 0.0f ? pitch : 1.0f);
     v->pos_int = 0;
     v->pos_frac = 0;
-    v->pitch = 1.0f;
-    v->gain = v->targetGain = vol;
-    v->fadeFramesLeft = 0;
-    v->gainStep = 0.0f;
-    v->loop = false;
+    // Short attack ramp (~2.7ms) instead of starting at full scale: avoids
+    // the broadband click of cutting into a waveform mid-cycle, including
+    // on voice steal. mix_voice() already applies gainStep per frame.
+    v->gain = 0.0f;
+    v->targetGain = vol;
+    v->fadeFramesLeft = 128;
+    v->gainStep = vol / 128.0f;
+    v->loop = loop ? true : false;
     v->paused = false;
     v->sndId = sndId;
     v->instance = instance;
@@ -642,12 +693,79 @@ void audio_stop_all(void) {
     pthread_mutex_unlock(&gLock);
 }
 
+int audio_is_sound_playing(int sndId) {
+    if (!gAudioReady) return 0;
+    pthread_mutex_lock(&gLock);
+    int playing = 0;
+    if (gBig.smp && gBig.sndId == sndId && !gBig.paused) playing = 1;
+    for (int i = 0; !playing && i < MAX_VOICES; i++) {
+        if (gVoices[i].smp && gVoices[i].sndId == sndId && !gVoices[i].paused)
+            playing = 1;
+    }
+    pthread_mutex_unlock(&gLock);
+    return playing;
+}
+
 void GLMediaPlayer_playSound(jmethodID id, va_list args) {
     (void) id;
     int sndId = va_arg(args, jint);
     int instance = va_arg(args, jint);
     float vol = (float) va_arg(args, double);
-    audio_play_sound(sndId, instance, vol);
+    // One-shot JNI path (no pitch/loop params here -- per-frame RPM sweeps
+    // arrive via nativeSetPitch/nativeSetVolume below).
+    audio_play_sound(sndId, instance, vol, 1.0f, 0);
+}
+
+// Exact (sndId,instance) match first; sndId-only fallback second. The
+// playEx hook stores instance=1 (its own constant return handle) while the
+// engine's native stop/pitch/vol calls carry the real channel -- without
+// the fallback every one of those updates misses and loops never stop.
+static Voice *voice_find(int sndId, int instance) {
+    for (int i = 0; i < MAX_VOICES; i++) {
+        if (gVoices[i].smp && gVoices[i].sndId == sndId && gVoices[i].instance == instance)
+            return &gVoices[i];
+    }
+    for (int i = 0; i < MAX_VOICES; i++) {
+        if (gVoices[i].smp && gVoices[i].sndId == sndId)
+            return &gVoices[i];
+    }
+    return NULL;
+}
+
+void audio_stop_sound(int sndId, int instance) {
+    if (!gAudioReady) return;
+    pthread_mutex_lock(&gLock);
+    Voice *v = voice_find(sndId, instance);
+    if (v) v->smp = NULL;
+    if (gBig.smp && gBig.sndId == sndId) gBig.smp = NULL;
+    pthread_mutex_unlock(&gLock);
+}
+
+void audio_set_voice_pitch(int sndId, int instance, float pitch) {
+    if (!gAudioReady) return;
+    if (pitch < 0.1f) pitch = 0.1f;
+    if (pitch > 4.0f) pitch = 4.0f;
+    pthread_mutex_lock(&gLock);
+    Voice *v = voice_find(sndId, instance);
+    if (v && v->smp) voice_set_step(v, v->smp->rate, pitch);
+    pthread_mutex_unlock(&gLock);
+}
+
+void audio_set_voice_volume(int sndId, int instance, float vol) {
+    if (!gAudioReady) return;
+    if (vol < 0.0f) vol = 0.0f;
+    if (vol > 1.0f) vol = 1.0f;
+    pthread_mutex_lock(&gLock);
+    Voice *v = voice_find(sndId, instance);
+    if (v) {
+        // Ramp instead of an instant jump: the engine drives volume per
+        // frame (Doppler/engine load), a hard step each frame is zipper
+        // noise. mix_voice() applies gainStep per frame.
+        v->targetGain = vol;
+        v->fadeFramesLeft = 64;
+        v->gainStep = (vol - v->gain) / 64.0f;
+    }
+    pthread_mutex_unlock(&gLock);
 }
 
 void GLMediaPlayer_playSoundBig(jmethodID id, va_list args) {
@@ -673,10 +791,8 @@ void GLMediaPlayer_pauseSound(jmethodID id, va_list args) {
     int sndId = va_arg(args, jint);
     int instance = va_arg(args, jint);
     pthread_mutex_lock(&gLock);
-    for (int i = 0; i < MAX_VOICES; i++) {
-        if (gVoices[i].smp && gVoices[i].sndId == sndId && gVoices[i].instance == instance)
-            gVoices[i].paused = true;
-    }
+    Voice *v = voice_find(sndId, instance);
+    if (v) v->paused = true;
     pthread_mutex_unlock(&gLock);
 }
 
@@ -693,10 +809,8 @@ void GLMediaPlayer_resumeSound(jmethodID id, va_list args) {
     int sndId = va_arg(args, jint);
     int instance = va_arg(args, jint);
     pthread_mutex_lock(&gLock);
-    for (int i = 0; i < MAX_VOICES; i++) {
-        if (gVoices[i].smp && gVoices[i].sndId == sndId && gVoices[i].instance == instance)
-            gVoices[i].paused = false;
-    }
+    Voice *v = voice_find(sndId, instance);
+    if (v) v->paused = false;
     pthread_mutex_unlock(&gLock);
 }
 
@@ -712,12 +826,7 @@ void GLMediaPlayer_stopSound(jmethodID id, va_list args) {
     (void) id;
     int sndId = va_arg(args, jint);
     int instance = va_arg(args, jint);
-    pthread_mutex_lock(&gLock);
-    for (int i = 0; i < MAX_VOICES; i++) {
-        if (gVoices[i].smp && gVoices[i].sndId == sndId && gVoices[i].instance == instance)
-            gVoices[i].smp = NULL;
-    }
-    pthread_mutex_unlock(&gLock);
+    audio_stop_sound(sndId, instance);
 }
 
 void GLMediaPlayer_stopSoundBig(jmethodID id, va_list args) {
@@ -736,15 +845,7 @@ void GLMediaPlayer_setVolume(jmethodID id, va_list args) {
     int sndId = va_arg(args, jint);
     int instance = va_arg(args, jint);
     float vol = (float) va_arg(args, double);
-    if (vol < 0.0f) vol = 0.0f;
-    if (vol > 1.0f) vol = 1.0f;
-    
-    pthread_mutex_lock(&gLock);
-    for (int i = 0; i < MAX_VOICES; i++) {
-        if (gVoices[i].smp && gVoices[i].sndId == sndId && gVoices[i].instance == instance)
-            gVoices[i].gain = gVoices[i].targetGain = vol;
-    }
-    pthread_mutex_unlock(&gLock);
+    audio_set_voice_volume(sndId, instance, vol);
 }
 
 void GLMediaPlayer_setVolumeBig(jmethodID id, va_list args) {
@@ -765,19 +866,7 @@ void GLMediaPlayer_setPitch(jmethodID id, va_list args) {
     int sndId = va_arg(args, jint);
     int instance = va_arg(args, jint);
     float pitch = (float) va_arg(args, double);
-    if (pitch < 0.1f) pitch = 0.1f;
-    if (pitch > 4.0f) pitch = 4.0f;
-
-    pthread_mutex_lock(&gLock);
-    for (int i = 0; i < MAX_VOICES; i++) {
-        if (gVoices[i].smp && gVoices[i].sndId == sndId && gVoices[i].instance == instance) {
-            gVoices[i].pitch = pitch;
-            double step_d = ((double)gVoices[i].smp->rate / (double)MIX_RATE) * (double)pitch;
-            gVoices[i].step_int = (unsigned int) step_d;
-            gVoices[i].step_frac = (unsigned int) ((step_d - (double)gVoices[i].step_int) * 4294967296.0);
-        }
-    }
-    pthread_mutex_unlock(&gLock);
+    audio_set_voice_pitch(sndId, instance, pitch);
 }
 
 void GLMediaPlayer_stopAllSounds(jmethodID id, va_list args) {

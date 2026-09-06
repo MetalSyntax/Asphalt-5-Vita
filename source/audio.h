@@ -11,9 +11,13 @@ void audio_init(void);
 void audio_shutdown(void);
 
 // Direct C audio API (for patch.c and internal engine hooks)
-void audio_play_sound(int sndId, int instance, float vol);
+void audio_play_sound(int sndId, int instance, float vol, float pitch, int loop);
 void audio_play_sound_big(int sndId, float vol, int loop);
 void audio_stop_all(void);
+void audio_stop_sound(int sndId, int instance);
+void audio_set_voice_pitch(int sndId, int instance, float pitch);
+void audio_set_voice_volume(int sndId, int instance, float vol);
+int audio_is_sound_playing(int sndId);
 
 // GLMediaPlayer JNI sound bridge
 jint GLMediaPlayer_isSoundLoaded(jmethodID id, va_list args);

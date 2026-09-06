@@ -86,14 +86,38 @@ static void hook_CMatrix_SetMult(cmatrix_raw * this_, const cmatrix_raw * a, con
 #include "audio.h"
 
 static int hook_BaseSoundManager_playEx(void *this_, int soundId, const float *pos, int loop, float vol, int priority, int group, float pitch, void (*cb)()) {
-    (void) this_; (void) pos; (void) loop; (void) priority; (void) group; (void) pitch; (void) cb;
-    audio_play_sound(soundId, 0, vol > 0.0f ? vol : 1.0f);
+    (void) this_; (void) pos; (void) priority; (void) group; (void) cb;
+    // Pass loop+pitch through (both were discarded before: loops played as
+    // one-shots that got stolen, and the engine hum sat at base pitch).
+    // vol<=0 means "use default" on this path.
+    audio_play_sound(soundId, 1, vol > 0.0f ? vol : 1.0f, pitch > 0.0f ? pitch : 1.0f, loop);
     return 1;
 }
 
 static int hook_BaseSoundManager_stopAllSounds() {
     audio_stop_all();
     return 0;
+}
+
+// stop(int,int,int) and stop(int,int,int,int) are both (this, soundId,
+// channel, ...) per the disassembly (soundId*24 table stride, channel
+// passed on to nativeStopSound). Previously ret0: loops could never stop,
+// so e.g. the engine hum kept droning after the race ended.
+static int hook_BaseSoundManager_stop3(void *this_, int soundId, int channel) {
+    (void) this_; (void) channel;
+    audio_stop_sound(soundId, channel);
+    return 0;
+}
+
+static int hook_BaseSoundManager_stop4(void *this_, int soundId, int channel, int a, int b) {
+    (void) this_; (void) channel; (void) a; (void) b;
+    audio_stop_sound(soundId, channel);
+    return 0;
+}
+
+static int hook_BaseSoundManager_isSoundPlaying(void *this_, int a, int sndId, int b) {
+    (void) this_; (void) a; (void) b;
+    return audio_is_sound_playing(sndId);
 }
 
 static int hook_BaseSoundManager_ret0() {
@@ -193,14 +217,14 @@ void so_patch(void) {
     
     // Sound Manager bridges
     hook_addr((uintptr_t) so_symbol(&so_mod, "_ZN16BaseSoundManager6playExEiPKfbfiifPFvvE"), (uintptr_t) &hook_BaseSoundManager_playEx);
-    hook_addr((uintptr_t) so_symbol(&so_mod, "_ZN16BaseSoundManager4stopEiiii"), (uintptr_t) &hook_BaseSoundManager_ret0);
-    hook_addr((uintptr_t) so_symbol(&so_mod, "_ZN16BaseSoundManager4stopEiii"), (uintptr_t) &hook_BaseSoundManager_ret0);
+    hook_addr((uintptr_t) so_symbol(&so_mod, "_ZN16BaseSoundManager4stopEiii"), (uintptr_t) &hook_BaseSoundManager_stop3);
+    hook_addr((uintptr_t) so_symbol(&so_mod, "_ZN16BaseSoundManager4stopEiiii"), (uintptr_t) &hook_BaseSoundManager_stop4);
     hook_addr((uintptr_t) so_symbol(&so_mod, "_ZN16BaseSoundManager10stopAllSfxEi"), (uintptr_t) &hook_BaseSoundManager_stopAllSounds);
     hook_addr((uintptr_t) so_symbol(&so_mod, "_ZN16BaseSoundManager13stopAllSoundsEv"), (uintptr_t) &hook_BaseSoundManager_stopAllSounds);
     hook_addr((uintptr_t) so_symbol(&so_mod, "_ZN16BaseSoundManager13stopAllMusicsEi"), (uintptr_t) &hook_BaseSoundManager_stopAllSounds);
     hook_addr((uintptr_t) so_symbol(&so_mod, "_ZN16BaseSoundManager19stopAllSecondMusicsEv"), (uintptr_t) &hook_BaseSoundManager_stopAllSounds);
     hook_addr((uintptr_t) so_symbol(&so_mod, "_ZN16BaseSoundManager6updateEi"), (uintptr_t) &hook_BaseSoundManager_ret0);
-    hook_addr((uintptr_t) so_symbol(&so_mod, "_ZN16BaseSoundManager14isSoundPlayingEiii"), (uintptr_t) &hook_BaseSoundManager_ret0);
+    hook_addr((uintptr_t) so_symbol(&so_mod, "_ZN16BaseSoundManager14isSoundPlayingEiii"), (uintptr_t) &hook_BaseSoundManager_isSoundPlaying);
 
 #ifdef ENABLE_PERF_TELEMETRY
     // Was previously missing entirely -- hook_Scene_* were defined above but

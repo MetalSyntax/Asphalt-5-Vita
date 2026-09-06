@@ -44,6 +44,20 @@ extern so_module so_mod;
 #define TOUCH_TARGET_W 800
 #define TOUCH_TARGET_H 480
 
+// Marker for slots owned by poll_keys() fake touches -- never a real
+// SceTouchReport id. poll_touch() skips these (it must not track or
+// release them); only fake_touch_set/release manage them.
+#define FAKE_VITA_ID 0xFF
+
+// Fake-touch indices (buttons mapped to synthetic taps).
+#define FAKE_IDX_LEFT  0
+#define FAKE_IDX_RIGHT 1
+#define FAKE_IDX_CROSS 2
+#define FAKE_IDX_SQUARE 3
+#define FAKE_IDX_START 4
+#define FAKE_IDX_MENU_TAP 5
+#define FAKE_COUNT 6
+
 typedef struct {
     bool active;
     uint8_t vita_id;
@@ -86,6 +100,8 @@ static void poll_touch(void * env, void * clazz) {
 
         int slot = -1;
         for (int s = 0; s < MAX_TOUCH_SLOTS; s++) {
+            if (s_slots[s].active && s_slots[s].vita_id == FAKE_VITA_ID)
+                continue; // owned by fake_touch_set(), never match a finger
             if (s_slots[s].active && s_slots[s].vita_id == vid) {
                 slot = s;
                 break;
@@ -107,6 +123,7 @@ static void poll_touch(void * env, void * clazz) {
             s_slots[slot].x       = x;
             s_slots[slot].y       = y;
             seen[slot] = true;
+            l_info("input: touch press (%d,%d) slot %d", x, y, slot);
             if (s_pressed)
                 s_pressed(env, clazz, x, y, slot);
             continue;
@@ -122,8 +139,9 @@ static void poll_touch(void * env, void * clazz) {
     }
 
     for (int s = 0; s < MAX_TOUCH_SLOTS; s++) {
-        if (s_slots[s].active && !seen[s]) {
+        if (s_slots[s].active && !seen[s] && s_slots[s].vita_id != FAKE_VITA_ID) {
             s_slots[s].active = false;
+            l_info("input: touch release (%d,%d) slot %d", s_slots[s].x, s_slots[s].y, s);
             if (s_released)
                 s_released(env, clazz, s_slots[s].x, s_slots[s].y, s);
         }
@@ -177,12 +195,78 @@ static app_state_t get_current_app_state(void) {
     return APP_STATE_MENU;
 }
 
+static int s_fake_slot[FAKE_COUNT] = { -1, -1, -1, -1, -1, -1 };
+static bool s_fake_down[FAKE_COUNT] = { false, false, false, false, false, false };
+static int s_fake_x[FAKE_COUNT] = { 100, 700, 720, 50, 50, 400 };
+static int s_fake_y[FAKE_COUNT] = { 240, 240, 400, 430, 50, 240 };
+
 // Track fake touches to emit pressed/released
 static bool s_fake_left_down = false;
 static bool s_fake_right_down = false;
 static bool s_fake_cross_down = false;
 static bool s_fake_square_down = false;
 static bool s_fake_start_down = false;
+static bool s_fake_menu_tap_down = false;
+static app_state_t s_prev_state = APP_STATE_UNKNOWN;
+
+static void fake_touch_release(void *env, void *clazz, int idx) {
+    if (idx < 0 || idx >= FAKE_COUNT)
+        return;
+    int slot = s_fake_slot[idx];
+    if (slot >= 0 && slot < MAX_TOUCH_SLOTS) {
+        if (s_released)
+            s_released(env, clazz, s_fake_x[idx], s_fake_y[idx], slot);
+        s_slots[slot].active = false;
+    }
+    s_fake_slot[idx] = -1;
+    s_fake_down[idx] = false;
+}
+
+static void fake_touch_set(void *env, void *clazz, int idx, bool down, int x, int y) {
+    if (idx < 0 || idx >= FAKE_COUNT)
+        return;
+    s_fake_x[idx] = x;
+    s_fake_y[idx] = y;
+    if (down == s_fake_down[idx] && (down == false || s_fake_slot[idx] >= 0))
+        return;
+    if (!down) {
+        fake_touch_release(env, clazz, idx);
+        return;
+    }
+    // Press: claim a free real slot so we can never collide with a live
+    // finger tracked by poll_touch().
+    if (s_fake_slot[idx] < 0) {
+        for (int s = 0; s < MAX_TOUCH_SLOTS; s++) {
+            if (!s_slots[s].active) {
+                s_fake_slot[idx] = s;
+                s_slots[s].active = true;
+                s_slots[s].vita_id = FAKE_VITA_ID;
+                s_slots[s].x = x;
+                s_slots[s].y = y;
+                break;
+            }
+        }
+        if (s_fake_slot[idx] < 0)
+            return; // both slots busy with real fingers -- retry next frame
+    }
+    s_fake_down[idx] = true;
+    if (s_pressed)
+        s_pressed(env, clazz, x, y, s_fake_slot[idx]);
+}
+
+static void input_release_all_fake(void *env, void *clazz) {
+    for (int i = 0; i < FAKE_COUNT; i++) {
+        if (s_fake_down[i] || s_fake_slot[i] >= 0)
+            fake_touch_release(env, clazz, i);
+    }
+    // Key-emulating flags share storage with the touch flags below; make
+    // sure a held DPAD key can't stick either.
+    if (s_fake_left_down && s_key_up) s_key_up(env, clazz, 19);
+    if (s_fake_right_down && s_key_up) s_key_up(env, clazz, 20);
+    if (s_fake_cross_down && s_key_up) s_key_up(env, clazz, 23);
+    s_fake_left_down = s_fake_right_down = s_fake_cross_down = false;
+    s_fake_square_down = s_fake_start_down = s_fake_menu_tap_down = false;
+}
 
 static void poll_keys(void * env, void * clazz) {
     SceCtrlData pad;
@@ -190,43 +274,47 @@ static void poll_keys(void * env, void * clazz) {
         return;
 
     app_state_t state = get_current_app_state();
+    if (state != s_prev_state) {
+        // INGAME<->MENU<->TITLE reuse the same s_fake_* flags with different
+        // meanings; a button held across the transition would otherwise leave
+        // a touch pressed (or key down) that is never released, and the engine
+        // treats that slot as a stuck finger -- post-race screens then see
+        // every fresh tap as a move of the ghost finger and never advance.
+        l_info("input: state %d -> %d", (int) s_prev_state, (int) state);
+        input_release_all_fake(env, clazz);
+        s_prev_state = state;
+    }
 
     if (state == APP_STATE_INGAME) {
-        // IN-GAME Mapping
+        // IN-GAME Mapping -- every synthetic tap goes through the shared
+        // slot allocator (fake_touch_set), never a hardcoded slot.
         bool left_down = (pad.buttons & SCE_CTRL_LEFT) != 0 || (pad.buttons & SCE_CTRL_LTRIGGER) != 0;
         bool right_down = (pad.buttons & SCE_CTRL_RIGHT) != 0 || (pad.buttons & SCE_CTRL_RTRIGGER) != 0;
         bool cross_down = (pad.buttons & SCE_CTRL_CROSS) != 0;
         bool square_down = (pad.buttons & SCE_CTRL_SQUARE) != 0;
         bool start_down = (pad.buttons & SCE_CTRL_START) != 0;
 
-        // Virtual Touch Slots (0 and 1 are used by real touch, but we can reuse them if touch is inactive)
-        // We split into two slots: Slot 0 for steering, Slot 1 for pedals/actions.
-        
-        #define DISPATCH_TOUCH(btn_state, is_down, tx, ty, slot) \
-            if (is_down != btn_state) { \
-                btn_state = is_down; \
-                if (is_down && s_pressed) s_pressed(env, clazz, tx, ty, slot); \
-                else if (!is_down && s_released) s_released(env, clazz, tx, ty, slot); \
-            }
-
-        // Steer Left (Left blank area) -> Slot 0
-        DISPATCH_TOUCH(s_fake_left_down, left_down, 100, 240, 0);
-        // Steer Right (Right blank area) -> Slot 0
-        DISPATCH_TOUCH(s_fake_right_down, right_down, 700, 240, 0);
-        
-        // Nitrous (Cross) -> Slot 1
-        DISPATCH_TOUCH(s_fake_cross_down, cross_down, 720, 400, 1);
-        // Brake (Square) -> Slot 1
-        DISPATCH_TOUCH(s_fake_square_down, square_down, 50, 430, 1);
-        // Pause (Start) -> Slot 1
-        DISPATCH_TOUCH(s_fake_start_down, start_down, 50, 50, 1);
+        fake_touch_set(env, clazz, FAKE_IDX_LEFT, left_down, 100, 240);
+        fake_touch_set(env, clazz, FAKE_IDX_RIGHT, right_down, 700, 240);
+        fake_touch_set(env, clazz, FAKE_IDX_CROSS, cross_down, 720, 400);
+        fake_touch_set(env, clazz, FAKE_IDX_SQUARE, square_down, 50, 430);
+        fake_touch_set(env, clazz, FAKE_IDX_START, start_down, 50, 50);
+        s_fake_left_down = left_down;
+        s_fake_right_down = right_down;
+        s_fake_cross_down = cross_down;
+        s_fake_square_down = square_down;
+        s_fake_start_down = start_down;
 
     } else if (state == APP_STATE_TITLE) {
         bool any_down = (pad.buttons & (SCE_CTRL_CROSS | SCE_CTRL_SQUARE | SCE_CTRL_TRIANGLE | SCE_CTRL_START)) != 0;
-        DISPATCH_TOUCH(s_fake_start_down, any_down, 400, 240, 1);
+        fake_touch_set(env, clazz, FAKE_IDX_START, any_down, 400, 240);
+        s_fake_start_down = any_down;
 
     } else {
-        // MENU Mapping (APP_STATE_MENU)
+        // MENU Mapping (APP_STATE_MENU -- includes post-race GS_EndRaceScreen /
+        // GS_RaceSummary, whose phase-1 gate only watches s_mouseCount, i.e. a
+        // fresh touch; key 23 alone can never advance it). So CROSS sends BOTH
+        // a center tap (advances the gate) and DPAD_CENTER (for later nav).
         bool up_down = (pad.buttons & SCE_CTRL_UP) != 0 || pad.ly < 64;
         bool down_down = (pad.buttons & SCE_CTRL_DOWN) != 0 || pad.ly > 192;
         bool cross_down = (pad.buttons & SCE_CTRL_CROSS) != 0;
@@ -241,11 +329,12 @@ static void poll_keys(void * env, void * clazz) {
         DISPATCH_KEY(s_fake_left_down, up_down, 19); // KEYCODE_DPAD_UP
         DISPATCH_KEY(s_fake_right_down, down_down, 20); // KEYCODE_DPAD_DOWN
         DISPATCH_KEY(s_fake_cross_down, cross_down, 23); // KEYCODE_DPAD_CENTER
+        // Post-race screens ignore keys -- CROSS also taps center.
+        fake_touch_set(env, clazz, FAKE_IDX_MENU_TAP, cross_down, 400, 240);
+        s_fake_menu_tap_down = cross_down;
 
         #undef DISPATCH_KEY
     }
-
-    #undef DISPATCH_TOUCH
 
     // Default universal BACK button (Circle) for menus
     bool circle_down = (pad.buttons & SCE_CTRL_CIRCLE) != 0;

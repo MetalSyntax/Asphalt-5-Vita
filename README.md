@@ -46,18 +46,27 @@ Since this is a Beta release, keep in mind:
   720x432 offscreen FBO downsampled to the native 960x544 panel (menu layout still
   reports 800x480 to the engine so UI scaling stays correct).
 - **Audio**: Custom 32-bit fixed-point audio mixer with linear interpolation running on the `MAIN` audio port.
+  It honors the engine's loop/pitch/volume/stop commands: looped engine sounds track RPM via live pitch updates,
+  long music tracks get a dedicated unstolen voice (mirroring the engine's `nativePlaySoundBig` path), one-shot
+  SFX live in a 16-voice pool that prefers stealing one-shots over loops, and the master bus uses gain compensation
+  (`1/sqrt(N)`) plus a soft limiter instead of hard clipping.
 - **Input**: Full physical button support! D-Pad/Analog for menus, and full steering/pedal support during races.
+  The router is state-aware (title / menu / in-race): synthetic touches share the same 2-slot allocator as real
+  fingers so they can never collide, held buttons are cleanly released on state transitions (no stuck "ghost"
+  fingers after a race), and on post-race results screens Cross sends both a center-tap (which is what those
+  screens actually listen for) and DPAD_CENTER.
 - **Assets from `ux0:`**: Resource loader reads game assets/chunks from `ux0:data/asphalt5/`
   with an LRU cache to reduce SD card stutter.
 
 ### ⚠️ Known Issues
 
-- **Audio quirks**: While heavily improved, the audio mixing still has some minor distortions or volume balancing issues in certain heavy tracks.
+- **Audio quirks**: Mostly resolved (loops, music, pitch, stop handling — see above). If a specific track still
+  sounds off, grab a console log: audio loads and voice events are logged with the `sndId` needed to trace it.
 - **Beta bugs**: Unmapped physical buttons in very specific sub-menus or rare cache trashing between
   the asset cache and the GPU resource pool, and vitaGL vertex pool pressure —
   see the bug log in [`port_progress.md`](port_progress.md) (Bugs #9, #16–#22).
-- **Video playback**: The Gameloft intro trailer is skipped instantly instead of
-  being decoded (h264 decoding not implemented).
+- **Video playback**: The intro trailer plays via the FFmpeg software decoder when the `.mp4` is present in
+  `ux0:data/asphalt5/data/`; if the file is missing/unreadable it is skipped instantly instead of hanging.
 
 ---
 
