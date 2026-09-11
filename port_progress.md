@@ -1967,3 +1967,120 @@ Log `logs/asphalt5_059.log`: efectos ya audibles, pero (a) un sonido raro (motor
 **Input (`source/input.c`):** touches sintéticos por el allocator compartido (`FAKE_VITA_ID`, `poll_touch` los ignora); release total en cada cambio de estado (adiós dedos fantasma); CROSS en menús post-carrera manda tap al centro + DPAD_CENTER; logging `input: state A -> B` + `press/release` para diagnosticar con el próximo log.
 
 **Docs:** `README.md` (audio/input/known issues) y `RELEASE_BETA.md` actualizados a lo verificado en hardware (log 059).
+
+### Bug #24 -- CONFIRMADO Y CORREGIDO: el video de intro sigue sin reproducirse -- el `libavformat.a` instalado no tiene el demuxer "mov" (MP4), sólo el muxer
+
+**Log:** `logs/asphalt5_066.log` -- con el `AVIOContext` sobre `sceIo` ya andando (se ven los `file read #N` reales, hasta 1048576 bytes), `avformat_open_input` sigue fallando:
+
+```
+[INFO   ] video: No explicit demuxer found, letting FFmpeg auto-detect
+[INFO   ] video: file read #1 len=65536 -> 65536
+[INFO   ] video: file read #2 len=65536 -> 65536
+[INFO   ] video: file read #3 len=131072 -> 131072
+[INFO   ] video: file read #4 len=262144 -> 262144
+[INFO   ] video: file read #5 len=524288 -> 524288
+[ERROR  ] video: avformat_open_input failed (-1094995529: Invalid data found when processing input) for .../A5_Ultimate_VNFS_2_854.mp4
+```
+
+Los tamaños leídos (64K, 64K, 128K, 256K, 512K) son exactamente el crecimiento por duplicación de `av_probe_input_buffer2()` hasta su tope de 1MB -- es decir, el código SÍ estaba cayendo al auto-probe genérico pese al bloque que intentaba forzar el demuxer por extensión (`av_find_input_format("mov")`), lo que sólo puede pasar si esa llamada devuelve NULL.
+
+**Causa raíz (confirmada contra el `.a` instalado, no adivinada):**
+
+```
+$ ar t ~/vitasdk/arm-vita-eabi/lib/libavformat.a | grep -i mov
+mov_chan.o/ mov_esds.o/ movenc.o/ movenc_ttml.o/ movenccenc.o/ movenchint.o/
+```
+
+Eso es el *muxer* de MP4 (`movenc.o`) más dos helpers compartidos -- **`mov.o`, el archivo que contiene `ff_mov_demuxer` (el demuxer de verdad), no está en el archivo**, pese a que la configuración embebida del build (`strings libavformat.a | grep enable-demuxer`) sí lista `--enable-demuxer=...,mp4,m4a,...`. Es un bug del recipe de `vdpm ffmpeg` (vita-portlibs), externo a este repo y no arreglable desde `source/`. Consecuencia: no hay NINGÚN demuxer en este build capaz de reconocer un contenedor MP4/MOV, ni pedido por nombre ni por auto-probe, sin importar el path o la extensión del archivo.
+
+Los archivos en sí son válidos (`ffprobe` en un host los lee sin problema, mismo tamaño exacto que loguea el port: `A5_Ultimate_VNFS_2_854.mp4` = 14837630 bytes).
+
+**Descartado en el camino:** un intento previo (no commiteado) de resolver esto sustituyendo `A5_Ultimate_VNFS_2` -> `A5_Ultimate_VNFS_2_854` y probando remuxes a `.mkv`/`.avi` en `resolve_video_path()` -- un workaround para este mismo bug, no una necesidad real (el motor siempre pide el nombre original sin sufijo), y que además no llegó a funcionar. Revertido.
+
+**Fix (`source/video.cpp`):** en vez de reinstalar/parchear el toolchain externo, se escribió un parser mínimo de ISO-BMFF (`mp4_open`/`mp4_parse_trak`/`mp4_parse_stbl`/`mp4_parse_stsd`/`mp4_next_packet`) que lee `moov`/`trak`/`mdia`/`minf`/`stbl` directamente vía `sceIoOpen`/`sceIoRead`/`sceIoLseek` -- sin `AVFormatContext` ni `AVIOContext`, `libavformat` no se usa más en este archivo -- y entrega los paquetes de video/audio a los decoders de `libavcodec` (MPEG-4 Part 2 / AAC, que sí están completos en este mismo build) en el mismo orden intercalado en que ya están en el archivo. Validado offline contra `A5_Ultimate_VNFS_2_854.mp4` (script Python espejando la lógica en C): `stsd` da fourcc/width/height/channels/samplerate correctos (854x480, mp4v; 2ch/44100Hz, mp4a), el `esds` da un VOL header de 30 bytes y un `AudioSpecificConfig` de 2 bytes coherentes, y la tabla de samples reconstruida desde `stsz`+`stsc`+`stco` da 1623 samples de video / 2325 de audio, offsets monótonos, todos dentro del archivo. Compila limpio (sin warnings) con `arm-vita-eabi-g++` y las flags reales del proyecto.
+
+También revertido en el mismo fix: la sustitución forzada a `_854` y las entradas `.mkv`/`.avi` de `resolve_video_path()` (ver arriba) -- ya no hacen falta.
+
+**Pendiente:** recompilar el `.vpk` completo (este entorno no tiene `vita-libs-gen` para el link final) y confirmar en consola que el intro reproduce solo, sin intervención del usuario.
+
+### Bug #25 -- CONFIRMADO: el video de intro por fin reproduce (Bug #24 resuelto), pero a ~10 FPS en vez de 30
+
+**Log:** `logs/asphalt5_067.log` -- el video ya se decodifica y dibuja de punta a punta (sin el bug del demuxer mov/MP4 del Bug #24), pero la línea de resumen final lo delata:
+
+```
+[INFO   ] video: loop exited! presented=221, decoded=234, dropped_late=12, audio_frames_played=344064, elapsed=22.19s, avg_fps=10.0 [yuv_convert=98.1ms/frame, tex_upload=12.6ms/frame, gl_draw+swap=0.9ms/frame]
+```
+
+`avg_fps=10.0` contra el objetivo de 30 fps fijo (`VIDEO_FRAME_PERIOD_US`, 33.33ms). El propio desglose por fase ya apunta al culpable sin necesidad de adivinar: `gl_draw+swap` (0.9ms) y `tex_upload` (12.6ms) están dentro de lo esperable, pero `yuv_convert` -- la conversión NEON YUV420P->RGB565 en `yuv420p_planar_to_rgb565()`, medida ajustadamente alrededor de esa única llamada dentro de `ring_push()` -- promedia **98.1ms/frame**, casi 3x el presupuesto entero de un frame a 30fps.
+
+**Causa raíz (no es la conversión NEON en sí):** con la CPU confirmada a 444MHz (`scePowerSetArmClockFrequency(444)` en `utils/init.c`), un pase NEON entero sobre 800x480 píxeles debería costar unos pocos ms, no 98. El diseño de threading tenía `VIDEO_DECODE_THREADS=3` (frame+slice threading de libavcodec) bajo la premisa de "usar todos los núcleos". Pero libavcodec crea ese pool interno con `pthread_create()` puro -- a diferencia de cada hilo que este archivo mismo lanza, ninguna llamada de afinidad de Vita le llega -- así que esos hasta 3 hilos de libavcodec quedan libres de vagar por los cores 0-2 sin restricción, apilándose sobre los mismos dos núcleos físicos que ya comparten el hilo de decode/conversión propio de este archivo (cores 1-2, `video_decode_thread()`) y el hilo de audio (core 2, prioridad tiempo-real), e incluso invadiendo el core 0 del hilo de render. El hilo que de verdad se mide (el que llama a `yuv420p_planar_to_rgb565()`) pierde su turno de CPU una y otra vez a mitad de la conversión, y ese tiempo de espera se contabiliza íntegro como "costo" de la conversión en el log -- es contención de scheduler, no cómputo real.
+
+**Fix (`source/video.cpp`):** `VIDEO_DECODE_THREADS` bajado de 3 a 1 -- decodificación de video sin threading interno de libavcodec. Esto elimina por completo el pool de hilos sin afinidad de libavcodec; sólo quedan compitiendo por los cores 1-2 los hilos propios de este archivo (ya afinizados explícitamente a Vita), en una proporción que el scheduler sí puede sostener. Se retiró también la asignación (ya sin efecto con `thread_count=1`) de `P.vctx->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE`. Bonus de correctitud: `handle_decoded_frame()` muta `P.vctx->skip_frame` entre llamadas para ponerse al día cuando la reproducción se atrasa, algo que sólo está bien definido si los frames se decodifican de a uno y en orden -- bajo frame-threading podía aplicarse a cualquiera de los frames que los hilos internos de libavcodec tuvieran en vuelo en ese momento.
+
+**Pendiente:** recompilar y confirmar en consola que el intro ahora sostiene ~30 fps (o al menos mucho más cerca que 10) y que `yuv_convert` cae a un orden de magnitud consistente con cómputo NEON puro (unos pocos ms/frame) en el próximo log.
+
+### Bug #25, segunda parte -- REFUTADO: la teoría de contención de scheduler NO era la causa
+
+**Log:** `logs/asphalt5_068.log`, ya con el fix anterior (`VIDEO_DECODE_THREADS=1`) corriendo en consola -- confirmado por la propia línea de log (`1 decode thread(s)`, antes decía 3):
+
+```
+[SUCCESS] video: playing ... -- 800x480 mpeg4, fixed 30 fps (period 33333us), 1 decode thread(s)
+...
+[INFO   ] video: loop exited! presented=102, decoded=103, dropped_late=0, audio_frames_played=148480, elapsed=10.82s, avg_fps=9.4 [yuv_convert=93.1ms/frame, tex_upload=12.6ms/frame, gl_draw+swap=1.5ms/frame]
+```
+
+`yuv_convert` sigue en 93.1ms/frame -- prácticamente idéntico a los 98.1ms del log #067, dentro del ruido normal entre corridas. Si la teoría de contención (el pool de 3 hilos sin afinidad de libavcodec robándole CPU al hilo de decode/conversión) hubiera sido la causa real, eliminar ese pool por completo tendría que haber cambiado el número de forma dramática. No lo hizo: **el fix de la primera parte no era incorrecto como cambio (sigue siendo una mejora legítima -- menos hilos compitiendo, y cierra el gap de correctitud de `skip_frame` bajo frame-threading), pero no ataca la verdadera causa del cuello de botella.** Queda refutado que la contención de scheduler con el pool de libavcodec fuera *la* causa (pudo, como mucho, ser un contribuyente menor).
+
+**Diagnóstico agregado (`source/video.cpp`, `source/utils/init.c`), para el próximo log, en vez de seguir adivinando:**
+- **`clocks: arm=...MHz bus=...MHz gpu=...MHz gpu_xbar=...MHz`** en `utils/init.c`, leyendo de vuelta con `scePowerGetArmClockFrequency()` y compañía en lugar de confiar en que los `scePowerSet*()` hayan tenido efecto -- para descartar (o confirmar) que la CPU/bus realmente corren al reloj esperado y no a algún default más bajo.
+- **`decode=X.Xms/frame`** nuevo en la línea de resumen de `video_play()`: tiempo real de `avcodec_send_packet`/`avcodec_receive_frame`, antes no medido en absoluto (sólo se medía la conversión). Si el decode en sí también resulta anormalmente lento, apunta a un problema de throughput de CPU más general (reloj, ABI, etc.) en vez de algo específico de `yuv420p_planar_to_rgb565()`.
+- **`video: startup benchmark (800x480, 8 runs, isolated from decode/ring/GL): yuv420p_planar_to_rgb565=X.Xms/call, memcpy(768000 bytes)=X.Xms/call (X MB/s)`**, nuevo, corrido una sola vez en `video_init()` (`video_log_startup_benchmark()`) contra buffers sintéticos en memoria -- sin hilos, sin mutexes, sin libavcodec, sin GL de por medio. Esto aísla la rutina de conversión por completo de la pipeline en vivo:
+  - Si el benchmark también da ~90ms/call, el costo es intrínseco a la rutina en este hardware (cómputo o ancho de banda de memoria real) y hay que optimizar/rediseñar la conversión en sí (o el resto de la pipeline en paralelo a ella).
+  - Si el benchmark da rápido (unos pocos ms), el problema está en el contexto del hilo de decode en vivo (algo que sigue compitiendo con él -- el hilo de audio, el hilo de render, u otra cosa todavía no identificada), no en el código de conversión.
+  - El `memcpy` de referencia (mismo tamaño de bytes, 768000) da un número de ancho de banda real de este dispositivo específico para comparar contra el costo de la conversión.
+
+**Pendiente:** recompilar, correr en consola, y traer el próximo log -- las tres líneas nuevas (`clocks:`, `decode=` en el resumen, `startup benchmark`) deberían ser suficiente evidencia para identificar la causa real sin más conjeturas.
+
+### Bug #25, tercera parte -- CONFIRMADO: el costo es intrínseco a la rutina; fix en dos frentes (half-res decode + conversor Q7)
+
+**Log:** `logs/asphalt5_069.log` -- las tres líneas de diagnóstico nuevas responden las tres preguntas:
+
+```
+[SUCCESS] ... clocks: arm=444MHz bus=222MHz gpu=222MHz gpu_xbar=166MHz
+[INFO   ] video: startup benchmark (800x480, 8 runs, isolated from decode/ring/GL): yuv420p_planar_to_rgb565=90.7ms/call, memcpy(768000 bytes)=1.6ms/call (468 MB/s)
+[INFO   ] video: loop exited! presented=76, decoded=77, dropped_late=0, ..., avg_fps=9.5 [decode=9.8ms/frame, yuv_convert=93.1ms/frame, tex_upload=12.6ms/frame, gl_draw+swap=1.6ms/frame]
+```
+
+- CPU sí corre a 444MHz (descartado reloj bajo / ATTRIBUTE2 sin overclock).
+- El benchmark aislado (buffers sintéticos, sin hilos/mutexes/libavcodec/GL) reproduce los ~90ms: **el costo es intrínseco a empujar 384k píxeles por esta rutina en este CPU**, no contención de scheduler de ningún tipo. Refutadas las dos teorías anteriores.
+- Desglose por frame (117ms total): decode 9.8 + convert 93.1 + upload 12.6 + draw/swap 1.6. El convert es el 80% del problema; el resto ya cabe en el presupuesto de 33.3ms.
+
+**Fix (`source/video.cpp`), dos cambios complementarios (ninguno solo bastaría):**
+1. **`P.vctx->lowres = 1` antes de `avcodec_open2()`** -- decodifica a 1/2 x 1/2 (400x240 trailer, 424x240 in-race). Cuarteta TODO lo proporcional a píxeles de una vez: conversión (~90->~22ms), `glTexSubImage2D` (12.6->~3ms: 192KB vs 768KB) y el propio decode MPEG-4 (~10->~4ms). El path de dibujado ya reescala con GL_LINEAR al FBO 720x432 sin cambios (400x240 es el mismo 5:3 exacto; 424x240 letterboxea como antes). Si un FFmpeg futuro ignorara `lowres`, sigue funcionando -- `ring_push`/`draw_video_frame` se dimensionan desde `f->width/height`, solo más lento. Cutscene skipeable a 30fps suave > nítida a 10fps.
+2. **Conversor NEON reescrito a Q7 int16** -- la versión Q16 ensanchaba a int32 con cadenas dependientes de 5-6 pasos (vmul->vshr->vmovn->combine->zip) que paran el pipeline NEON del Cortex-A9. Q7 cabe en int16 con margen (peor caso 227*-128 = -29056): cada canal es un `vmul` + un `vrshrq` (VRSHR con redondeo incluido), 3 pasos dependientes en total. Error vs referencia flotante verificado en host: máx 1 LSB en RGB565, media 0.08 -- invisible tras cuantizar a 5/6 bits. Estimación conjunta: ~4 + ~14 + ~3 + 1.6 ≈ 23ms/frame -> 30fps con margen.
+3. **Benchmark ahora mide 800x480 Y 400x240** -- el número live post-fix debe compararse contra el half-res, no contra el full.
+4. Línea `video: playing` ahora loguea `(lowres=%d)` y el tamaño DECODIFICADO real.
+
+**Pendiente:** recompilar, correr en consola, traer log #070 -- esperar `avg_fps≈30`, `yuv_convert` ~15ms, y `playing ... -- 400x240 mpeg4 (lowres=1)`.
+
+### Bug #25, cierre -- CONFIRMADO EN CONSOLA: el intro reproduce a ~30 FPS
+
+**Reporte del usuario (sin log #070 todavía):** el build con `lowres=1` + conversor Q7 reproduce el video del intro fluidamente — el fix funcionó en hardware real. Quedan pendientes los números exactos del próximo log (`avg_fps`, `yuv_convert`, `decode`, `tex_upload`, y la línea `playing ... 400x240 mpeg4 (lowres=1)`) para cerrar la evidencia, pero el síntoma (10 FPS) está resuelto.
+
+**Cambios que lo lograron (`source/video.cpp`, no commiteados aún al momento del reporte):**
+- `P.vctx->lowres = 1` antes de `avcodec_open2()` (decode a mitad de resolución).
+- Conversor NEON reescrito de Q16/int32 a Q7/int16 (`vrshrq_n_s16`, cadenas de 3 pasos).
+- Benchmark dual 800x480 + 400x240; línea `playing` con `(lowres=%d)`.
+- Verificación numérica en host del Q7 vs referencia flotante: máx 1 LSB RGB565.
+
+### Bug #26 -- NUEVO (reportado por el usuario): si la pantalla de la Vita se apaga, todo se congela
+
+**Síntoma:** dejando el port quieto (típicamente en un menú, sin tocar nada), la pantalla de la Vita se apaga por el ahorro de energía del sistema y a partir de ahí todo queda congelado sin recuperarse.
+
+**Causa raíz (por inspección, no confirmada aún en log):** nada en el port resetea el idle-timer del sistema, así que el power-save actúa con normalidad ante la falta de input: dim del OLED -> display off -> suspensión de la app. En ese momento el hilo de render está bloqueado dentro de esperas de display (`sceDisplay*` vía vitaGL `gl_swap()`) y los hilos de audio en `sceAudioOutOutput()` — esperas que tras el apagado nunca retornan, así que ningún hilo sale jamás del bloqueo: freeze total sin recuperación. No es un crash (no hay `.psp2dmp`), es un deadlock contra el cambio de estado de energía.
+
+**Fix (`source/main.c`, `source/video.cpp`):** `sceKernelPowerTick(SCE_KERNEL_POWER_TICK_DEFAULT)` una vez por frame — en el render loop principal y también en el present loop del video (que es dueño del hilo de render durante toda la cutscene, así que el tick del main no corre ahí). Esto resetea el idle-timer y evita que el auto-apagado/dim/suspensión se dispare por inactividad mientras el juego corre — la práctica estándar en ports/homebrew de Vita. Costo: una syscall por frame, despreciable. `ScePower_stub` ya estaba linkado (CMakeLists.txt), solo faltaba el include + la llamada.
+
+**No cubierto (pendiente de probar):** standby MANUAL con el botón power (suspensión/resume explícita del sistema) — es otro path distinto al idle-timer y sigue sin testearse. Si tras este fix el freeze solo aparece con botón power y no por inactividad, será un Bug #27 con su propio diagnóstico.
+
+**Pendiente:** recompilar, dejar el port quieto en un menú varios minutos (más que el ajuste de auto-apagado de la consola) y confirmar que la pantalla sigue encendida y el juego responde.

@@ -12,6 +12,7 @@
 #endif
 
 #include <psp2/kernel/threadmgr.h>
+#include <psp2/power.h>
 
 #include <falso_jni/FalsoJNI.h>
 #include <so_util/so_util.h>
@@ -183,6 +184,19 @@ int main() {
     l_info("Entering render loop. Log: %s", log_current_path());
 
     while (1) {
+        /*
+         * Bug #26: reset the system's idle timer every frame. Nothing else
+         * in this port touches it, so left alone the Vita's power-save would
+         * kick in whenever the player idles (menus especially): OLED dim ->
+         * display off -> app suspend, and the display/audio waits the engine
+         * and vitaGL are blocked in at that moment never come back --
+         * everything looks frozen and never recovers. Ticking with DEFAULT
+         * keeps auto-off/dimming/suspend from triggering on idleness while
+         * the game runs (the standard practice in Vita ports/homebrew).
+         * Manual standby via the power button is a different path and is
+         * still untested -- see port_progress.md.
+         */
+        sceKernelPowerTick(SCE_KERNEL_POWER_TICK_DEFAULT);
         input_poll(&jni, &jni);
 #ifdef ENABLE_PERF_TELEMETRY
         // FRAME covers one full Render()+present -- exactly the span the

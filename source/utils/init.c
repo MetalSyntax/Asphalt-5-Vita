@@ -55,6 +55,14 @@ void soloader_init_all() {
     scePowerSetBusClockFrequency(222);
     scePowerSetGpuClockFrequency(222);
     scePowerSetGpuXbarClockFrequency(166);
+    // Read the clocks back rather than trust the Set* calls above: Bug #25
+    // (video.cpp cutscene stuck at ~10fps despite the NEON conversion cost
+    // alone not accounting for it) needs to rule in/out the CPU actually
+    // running below 444MHz -- e.g. ATTRIBUTE2 not granting the overclock, or
+    // a Set* call silently failing -- before looking anywhere else.
+    l_info("clocks: arm=%dMHz bus=%dMHz gpu=%dMHz gpu_xbar=%dMHz",
+           scePowerGetArmClockFrequency(), scePowerGetBusClockFrequency(),
+           scePowerGetGpuClockFrequency(), scePowerGetGpuXbarClockFrequency());
 
 #ifdef USE_SCELIBC_IO
     if (fios_init(DATA_PATH) == 0)
