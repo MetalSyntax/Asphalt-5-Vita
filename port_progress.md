@@ -2084,3 +2084,103 @@ También revertido en el mismo fix: la sustitución forzada a `_854` y las entra
 **No cubierto (pendiente de probar):** standby MANUAL con el botón power (suspensión/resume explícita del sistema) — es otro path distinto al idle-timer y sigue sin testearse. Si tras este fix el freeze solo aparece con botón power y no por inactividad, será un Bug #27 con su propio diagnóstico.
 
 **Pendiente:** recompilar, dejar el port quieto en un menú varios minutos (más que el ajuste de auto-apagado de la consola) y confirmar que la pantalla sigue encendida y el juego responde.
+
+### Bug #27 -- CONFIRMADO POR ANÁLISIS Y CORREGIDO: el nitro (físico y táctil) necesita varios toques para activarse
+
+**Síntoma (reportado por el usuario):** el botón de nitro -- tanto CRUZ (físico) como el tap directo sobre el touch -- necesita presionarse varias veces para que el motor lo registre; debería activarse con un solo toque.
+
+**Causa raíz (`source/input.c`):** confirmado en el bug #5 que el motor real solo soporta **2 touches simultáneos** (`ASSERT` en `notifyTouchPress` si `id > 1`, pseudo-C). El commit `7a66877` ("Faithful engine audio ... + post-race input") reemplazó los slots fijos por un pool dinámico de 2 slots (`fake_touch_set`/`s_slots[MAX_TOUCH_SLOTS]`) compartido entre LEFT, RIGHT, CROSS (nitro), SQUARE (freno) y START -- 5 botones falsos para solo 2 cupos reales.
+
+En carrera, doblar (LEFT/RIGHT, 1 slot) + frenar (SQUARE, el otro slot) es exactamente el momento en que un jugador quiere nitro para salir de la curva: `fake_touch_set()` no encuentra slot libre para CROSS y descarta el press en silencio (`return; // both slots busy -- retry next frame`). El jugador termina mascando el botón hasta que, por casualidad, suelta el giro o el freno un frame y libera un cupo.
+
+Confirmado también en `CCar::UpdateNitro(int)` (Ghidra, `.so+0x166884`): la activación es un flag de un solo golpe (`this+0x55c`, seteado y limpiado en el mismo frame) que solo requiere que **un** evento de press limpio llegue dentro del rect del botón -- no hace falta mantenerlo, así que el problema es 100% de que el press nunca llega al motor, no de cómo el motor lo consume.
+
+**Fix:** `source/input.c` -- nueva `fake_touch_evict_for()`. Cuando CROSS (nitro) pide slot y los 2 están ocupados, desaloja el que tenga el botón de acción de menor prioridad (SQUARE o START -- nunca LEFT/RIGHT, que representan el giro sostenido). Ese botón desalojado simplemente vuelve a reclamar un slot el frame siguiente que haya uno libre, igual que si el jugador lo hubiera soltado un instante. Nitro pasa a tener garantía de slot inmediato.
+
+**De paso:** el build estaba roto desde el commit anterior (Bug #26) -- `source/main.c` llama `sceKernelPowerTick(SCE_KERNEL_POWER_TICK_DEFAULT)` pero solo incluía `<psp2/power.h>`; esa macro vive en `<psp2/kernel/processmgr.h>`. Agregado el include. Sin esto ningún build (ni el de este fix) compilaba.
+
+**Verificado:** compila limpio (`psvita-toolkit build --preset release`, VPK generado). Falta confirmar en consola real que nitro responde a un solo toque estando en curva/frenando.
+
+**Pendiente:** desplegar y confirmar en consola que CROSS activa nitro con un solo toque incluso doblando + frenando a la vez.
+
+### Bug #27, seguimiento -- `logs/asphalt5_072.log`: el fix de eviction no aplica -- el jugador usa el TOUCH real, no CROSS físico
+
+`asphalt5_072.log` (línea 145 en adelante, `state 1 -> 3` = INGAME) muestra la mashing de nitro
+como **12 taps reales** del panel táctil entre 111.9s y 115.1s, en `(700-730, 368-391)` -- todos
+con `input: touch press (...) slot 0` seguido de `input: touch release (...) slot 0` **exitosos**,
+nunca un `input: nitro preempting ...` (la eviction del fix anterior ni se disparó). O sea: en esta
+sesión el jugador tocó la pantalla directamente (no CROSS físico), y CADA toque SÍ llegó limpio al
+motor -- press+release, sin drop de slot. El fix de contención de slots de la ronda anterior era
+correcto para el camino de botón físico, pero no es la causa de que el toque directo en pantalla
+necesite varios intentos.
+
+Con el forwarding descartado como causa (llega limpio), lo que queda sin resolver vive dentro de
+`CCar::UpdateNitro`/el hit-test de `GS_Run` sobre esa región de pantalla -- ninguno de los dos se
+puede terminar de diagnosticar sin saber qué ve/oye el jugador en cada toque (¿ningún efecto
+nunca, o sí prende pero recién a la 3ra/4ta vez?). Sin ese dato no hay forma honesta de diferenciar
+"bug de hit-test/registro" de "mecánica real del juego" (nitro se **carga** manejando bien/con
+bonificaciones -- `CCar::AddNitro`, `NITRO_POWERUP` -- y no está disponible hasta juntar carga; si
+el jugador tocaba antes de tener nitro cargado, no pasa nada y es 100% esperado, no un bug).
+**Pendiente:** una respuesta del usuario para diferenciar ambos casos antes de tocar más código acá.
+
+### Bug #28 -- CONFIRMADO Y CORREGIDO: `Asphalt5.Exit()` era un stub vacío -- la app nunca podía cerrarse
+
+**Reportado por el usuario:** "no puedo... salirme completamente del juego que debería de cerrar la app."
+
+**Causa raíz (confirmada, no por inspección superficial):** `GS_IngameMenu::Update()` (Ghidra,
+`.so+0x107566`), rama `this+0x94==1` (sin diálogo de confirmación activo):
+
+```c
+if (*(int *)(in_r0 + 0x958) == 2) {   // confirmación "Exit" == aceptada
+    Game::Exit();
+    return;
+}
+```
+
+`Game::Exit()` (`.so`, ya documentado desde el bug #1) hace
+`CallStaticVoidMethod(env, mClassGLAsphalt5, mMethodExit)` -- una llamada nativa -> Java, id `18`
+(`Asphalt5.Exit`, confirmado en `generated_jni_table.h`). El stub auto-generado
+`stub_Asphalt5_Exit_18` (`source/generated_jni_stubs.c`) solo hacía `fjni_log_dbg(...)` y volvía --
+nunca terminaba el proceso. Confirmar "Exit" en CUALQUIER menú (pausa o principal) entonces no
+hacía absolutamente nada visible: ni crash, ni error, silencio total. Este bug es independiente de
+"volver al menú principal" (que es `Game::quitToMainMenu()`, 100% motor, sin JNI de por medio --
+ver el bug de seguimiento más abajo).
+
+**Fix:** `source/jni_lifecycle.c`/`.h` (nuevo) -- `impl_Asphalt5_Exit` hace `log_shutdown()` +
+`sceKernelExitProcess(0)`, el mismo mecanismo que ya usaba `fatal_error()` en
+`source/utils/dialog.c` para cerrar limpio. Registrado en `source/java.c` (id `18`, reemplazando el
+stub). Agregado a `CMakeLists.txt`.
+
+**Verificado:** compila limpio (`psvita-toolkit build --preset release`). Falta confirmar en
+consola que "Exit" (desde pausa y desde el menú principal) cierra la app de verdad.
+
+### Investigación en curso -- "no puedo volver al menú principal desde el in-game"
+
+`asphalt5_072.log` muestra al jugador entrando a lo que parece ser el menú de pausa (toque en
+`(0,45)`, esquina superior izquierda, dispara `state 3 -> 1` a los 127.979s) y después ~28
+segundos de toques reales sueltos en una zona angosta `(220-280, 300-410)` -- probablemente la
+lista de opciones de pausa (Reanudar/Reiniciar/Menú Principal/Salir) -- todos exitosos como
+press+release, pero el log nunca vuelve a mostrar un cambio de `state` bucket.
+
+**Ojo:** nuestro `state` (0/1/2/3 en el log) es un bucket de 3 categorías (`get_current_app_state()`
+en `source/input.c`) que agrupa TODO lo que no es `GS_Run`/título bajo el mismo "1" (MENU) --
+`GS_IngameMenu`, el `CPanel` de confirmación, `GS_MainMenu`, `GS_LoadMainMenu`, `GS_EndRaceScreen`,
+etc. son todos "1". Que el log se quede en "1" **no prueba que la transición interna del motor no
+haya ocurrido** -- `Game::quitToMainMenu()` (la función real detrás de "Menú Principal", confirmada
+en pseudo-C, `.so+0x8612`) es 100% motor, sin ningún JNI de por medio, así que en principio debería
+funcionar solo con el estado interno del juego.
+
+**Instrumentado para la próxima corrida (`source/input.c`):** `get_current_app_state()` ahora
+también devuelve el puntero crudo a la vtable del `gxGameState` activo (parámetro de salida), y
+`poll_keys()` loguea `input: game state vtable now %p (bucket %d)` cada vez que ese puntero
+cambia -- no solo cuando cambia el bucket. La tabla de `vtable for GS_XXX` ya extraída de
+`libasphalt5_symbols_by_addr.txt` (base `.so`, sumarle `0x98000000`) permite mapear la dirección
+exacta a la pantalla real (`GS_IngameMenu`=`0x1f0e70`, `CPanel`=`0x1ef8f0`,
+`GS_MainMenu`=`0x1f1050`, `GS_LoadMainMenu`=`0x1efd40`, `GS_EndRaceScreen`=`0x1f09c0`, etc.). El
+próximo log dirá si "Menú Principal" efectivamente empuja `GS_LoadMainMenu`/`GS_MainMenu` (y el
+bug está en otro lado -- p.ej. que esa pantalla se renderiza mal o queda esperando algo) o si el
+toque nunca llega a activar esa opción (bug de hit-test, quizás relacionado a que los toques
+caigan sobre el ítem equivocado de la lista de pausa).
+
+**Pendiente:** desplegar el build con la instrumentación, reproducir "entrar a pausa -> Menú
+Principal -> confirmar", y mandar el log nuevo.

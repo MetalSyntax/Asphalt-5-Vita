@@ -119,6 +119,7 @@ add_executable(${CMAKE_PROJECT_NAME}
                source/java.c
                source/jni_resloader.c
                source/jni_media.c
+               source/jni_lifecycle.c
                source/audio.cpp
                source/input.c
                source/generated_jni_stubs.c

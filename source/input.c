@@ -155,12 +155,20 @@ typedef enum {
     APP_STATE_INGAME
 } app_state_t;
 
-static app_state_t get_current_app_state(void) {
+// out_vtable_base (may be NULL) gets the raw vtable pointer of the current
+// top-of-stack gxGameState -- diagnostic only, so a log can be matched
+// against "vtable for GS_XXX" in libasphalt5_symbols_by_addr.txt to tell
+// APART the many real engine screens (GS_IngameMenu, the CPanel confirm
+// dialog, GS_MainMenu, GS_LoadMainMenu, GS_EndRaceScreen...) that all
+// collapse into the single APP_STATE_MENU bucket below.
+static app_state_t get_current_app_state(void **out_vtable_base) {
     static void *g_pMainGameClass = NULL;
     static void *vtable_GS_Run = NULL;
     static void *vtable_GS_Splash = NULL;
     static void *vtable_GS_GLLogo = NULL;
     static void *vtable_GS_TrailerMovie = NULL;
+
+    if (out_vtable_base) *out_vtable_base = NULL;
 
     if (!g_pMainGameClass) {
         g_pMainGameClass = (void*)so_symbol(&so_mod, "g_pMainGameClass");
@@ -186,6 +194,7 @@ static app_state_t get_current_app_state(void) {
     // In the Itanium C++ ABI (used by ARM), an object's vptr points to the first function
     // in the vtable, which is 8 bytes after the vtable symbol (skipping offset-to-top and typeinfo).
     void *vtable_base = (void*)((uintptr_t)vtable - 8);
+    if (out_vtable_base) *out_vtable_base = vtable_base;
 
     if (vtable_base == vtable_GS_Run)
         return APP_STATE_INGAME;
@@ -222,6 +231,31 @@ static void fake_touch_release(void *env, void *clazz, int idx) {
     s_fake_down[idx] = false;
 }
 
+// Nitro (CROSS) is a one-shot burst the engine consumes on the very touch
+// event that lands inside its button rect -- steering (LEFT/RIGHT) is a
+// sustained hold. With only MAX_TOUCH_SLOTS=2 shared between up to 5 fake
+// buttons, holding a turn (1 slot) plus the brake (SQUARE, the 2nd slot) --
+// the exact moment a player wants to nitro out of a corner -- left CROSS
+// with no free slot: fake_touch_set() silently dropped the press and the
+// player had to mash it until a slot happened to free up. Evict whichever
+// non-steering action (SQUARE/START) currently holds a slot so CROSS always
+// gets one immediately; that held button just re-claims a slot the next
+// frame one is free, same as if it had been briefly released.
+static void fake_touch_evict_for(void *env, void *clazz, int idx) {
+    for (int s = 0; s < MAX_TOUCH_SLOTS; s++)
+        if (!s_slots[s].active)
+            return; // a slot is already free, nothing to evict
+    for (int other = 0; other < FAKE_COUNT; other++) {
+        if (other == idx || other == FAKE_IDX_LEFT || other == FAKE_IDX_RIGHT)
+            continue;
+        if (s_fake_slot[other] >= 0) {
+            l_info("input: nitro preempting fake idx %d for a free touch slot", other);
+            fake_touch_release(env, clazz, other);
+            return;
+        }
+    }
+}
+
 static void fake_touch_set(void *env, void *clazz, int idx, bool down, int x, int y) {
     if (idx < 0 || idx >= FAKE_COUNT)
         return;
@@ -233,6 +267,8 @@ static void fake_touch_set(void *env, void *clazz, int idx, bool down, int x, in
         fake_touch_release(env, clazz, idx);
         return;
     }
+    if (idx == FAKE_IDX_CROSS && s_fake_slot[idx] < 0)
+        fake_touch_evict_for(env, clazz, idx);
     // Press: claim a free real slot so we can never collide with a live
     // finger tracked by poll_touch().
     if (s_fake_slot[idx] < 0) {
@@ -268,12 +304,19 @@ static void input_release_all_fake(void *env, void *clazz) {
     s_fake_square_down = s_fake_start_down = s_fake_menu_tap_down = false;
 }
 
+static void *s_prev_vtable = (void*)-1; // -1: never logged yet, distinct from a real NULL/unknown
+
 static void poll_keys(void * env, void * clazz) {
     SceCtrlData pad;
     if (sceCtrlPeekBufferPositive(0, &pad, 1) < 0)
         return;
 
-    app_state_t state = get_current_app_state();
+    void *vtable_base = NULL;
+    app_state_t state = get_current_app_state(&vtable_base);
+    if (vtable_base != s_prev_vtable) {
+        l_info("input: game state vtable now %p (bucket %d)", vtable_base, (int) state);
+        s_prev_vtable = vtable_base;
+    }
     if (state != s_prev_state) {
         // INGAME<->MENU<->TITLE reuse the same s_fake_* flags with different
         // meanings; a button held across the transition would otherwise leave
@@ -296,7 +339,16 @@ static void poll_keys(void * env, void * clazz) {
 
         fake_touch_set(env, clazz, FAKE_IDX_LEFT, left_down, 100, 240);
         fake_touch_set(env, clazz, FAKE_IDX_RIGHT, right_down, 700, 240);
-        fake_touch_set(env, clazz, FAKE_IDX_CROSS, cross_down, 720, 400);
+        // (715,380): recentered from the original (720,400) guess using the
+        // real touchscreen taps logged in asphalt5_072.log while the player
+        // mashed nitro by hand -- they clustered at x=700-730,y=368-391
+        // (center ~715,380), all forwarded cleanly (press+release, no
+        // dropped slot) yet only registered as nitro every few tries. That
+        // points at the button's hitbox being narrower than our guessed
+        // center, not at a forwarding bug -- nudge CROSS's synthetic tap to
+        // the empirically-observed hot zone so the physical button doesn't
+        // inherit the same near-miss.
+        fake_touch_set(env, clazz, FAKE_IDX_CROSS, cross_down, 715, 380);
         fake_touch_set(env, clazz, FAKE_IDX_SQUARE, square_down, 50, 430);
         fake_touch_set(env, clazz, FAKE_IDX_START, start_down, 50, 50);
         s_fake_left_down = left_down;

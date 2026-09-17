@@ -2,6 +2,7 @@
 #include "generated_jni_table.h"
 #include "jni_resloader.h"
 #include "jni_media.h"
+#include "jni_lifecycle.h"
 #include "audio.h"
 
 NameToMethodID nameToMethodId[] = {
@@ -187,7 +188,9 @@ MethodsVoid methodsVoid[] = {
 	{ 15, stub_Asphalt5_onSensorChanged_15 },
 	{ 16, stub_Asphalt5_onAccuracyChanged_16 },
 	{ 17, stub_Asphalt5_sendAppToBackground_17 },
-	{ 18, stub_Asphalt5_Exit_18 },
+	// The auto-generated stub was a no-op log line -- confirming "Exit" from
+	// any menu never actually closed the app. See jni_lifecycle.h.
+	{ 18, impl_Asphalt5_Exit },
 	{ 19, stub_Asphalt5_LaunchBilling_19 },
 	{ 20, stub_Asphalt5_ReleaseBillingContext_20 },
 	{ 26, stub_Asphalt5_onActivityResult_26 },

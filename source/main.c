@@ -12,6 +12,7 @@
 #endif
 
 #include <psp2/kernel/threadmgr.h>
+#include <psp2/kernel/processmgr.h>
 #include <psp2/power.h>
 
 #include <falso_jni/FalsoJNI.h>
