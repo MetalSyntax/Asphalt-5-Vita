@@ -36,13 +36,18 @@ void gl_swap();
  * targets the exact same size instead of a second hardcoded copy that could
  * drift out of sync (see Bug #13 in port_progress.md for what happens when it
  * does: the video gets clipped to whatever the FBO's real attachment size is).
- * 720x432 keeps the same 5:3 aspect as 800x480 (both a clean x0.9 in each
- * axis), so glViewport_soloader()/glScissor_soloader() below can rescale the
- * engine's 800x480-space rects onto it with exact integer math, no rounding
- * seams, and no distortion.
+ * Matches SCREEN_W/H (the 800x480 the engine was told the screen is)
+ * exactly -- a clean x1.0 in each axis, so glViewport_soloader()/
+ * glScissor_soloader() below rescale the engine's 800x480-space rects onto
+ * it with exact integer math (no-op, in fact), no rounding seams, and no
+ * distortion. Previously downscaled to 720x432 (x0.9); bumped back up to
+ * the full 800x480 the engine already renders in for a sharper image after
+ * the final upscale to the real 960x544 panel -- pick a smaller multiple
+ * here (any exact fraction of 800x480 keeps the same rescale math exact)
+ * if this turns out to cost too much frame time on hardware.
  */
-#define OFFSCREEN_W 720
-#define OFFSCREEN_H 432
+#define OFFSCREEN_W 800
+#define OFFSCREEN_H 480
 
 void glCopyTexImage2D_soloader(GLenum target, GLint level, GLenum internalformat, GLint x, GLint y, GLsizei width, GLsizei height, GLint border);
 void glCopyTexSubImage2D_soloader(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLint x, GLint y, GLsizei width, GLsizei height);

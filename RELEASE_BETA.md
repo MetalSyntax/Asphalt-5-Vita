@@ -7,14 +7,14 @@ This port uses a custom Android wrapper (soLoader/FalsoJNI) to run the original 
 Since this is a **Beta release**, the game is fully playable from start to finish, but please keep in mind that there are still some minor bugs and details being ironed out.
 
 ### ✨ Key Features in this Beta:
-* **Full Physical Controls Integration:** We've built a custom input router that seamlessly bridges Vita physical buttons with the game's native touch engine.
+* **Full Physical Controls Integration:** We've built a custom input router that seamlessly bridges Vita physical buttons with the game's native touch engine. It only works with the **Touch Buttons** control scheme (not Tilt or the drag-to-steer variants) — this is now forced automatically the very first time you run the port, before any save file exists.
   * **Menus:** Fully navigable using the **D-Pad** or **Left Analog Stick** (Up/Down). Use **❌ (Cross)** to select and **⭕ (Circle)** to go back.
   * **Title Screens:** Press any face button to instantly skip splash screens.
   * **In-Game Racing:** 
-    * **D-Pad Left/Right** (or L/R Triggers) to Steer.
+    * **D-Pad Left/Right, L/R Triggers, or Left Analog Stick** to Steer.
     * **❌ (Cross)** to trigger Nitrous.
     * **🟥 (Square)** to Brake / Drift.
-    * **Start** to Pause.
+    * **Start** to Pause (Circle no longer duplicates this in-race — it's menu-only Back now).
 * **Custom Optimized Audio Engine:** The original Android game used heavy floating-point math for audio mixing, which crippled the Vita's CPU. We wrote a custom 32-bit fixed-point audio mixer from scratch with **Linear Interpolation**, providing perfectly smooth engine pitches, zero stuttering, and high-fidelity 48kHz audio output through the Vita's MAIN audio port. It follows the engine's own routing: looped sounds (engine hum, skids) track RPM live, long music tracks get a dedicated voice that SFX can never steal, and the master bus uses a soft limiter so heavy scenes don't square-wave.
 * **Hardware Accelerated Graphics:** Running buttery smooth thanks to `vitaGL`.
 * **Post-Race Flow:** Results screens advance with a tap anywhere, or with **❌ (Cross)** on the pad — held steering/nitro from the race is cleanly released at the state change, so no more stuck input after crossing the finish line.
@@ -22,6 +22,8 @@ Since this is a **Beta release**, the game is fully playable from start to finis
 * **No Screen-Off Freeze:** The port resets the Vita's idle timer every frame, so the console's auto power-save can no longer turn the screen off and freeze the game while you read a menu.
 
 ### ⚠️ Known Issues / Beta Status:
+* **Open issue — Touch Buttons icons still visible, and Nitro often needs several presses:** the on-screen brake/nitro icons are drawn even though physical controls work, and ❌ (Cross) frequently needs multiple presses before Nitro actually fires — **except** pressing 🟥 (Square, brake/drift) immediately before ❌ (Cross), which reliably triggers Nitro on the very first try. Root cause not isolated yet; we need a console log capturing that exact drift-then-nitro pattern to fix it for real instead of guessing.
+* **Recent adjustments (build clean, not yet confirmed on real hardware):** left analog stick steering, a sharper internal render resolution (800x480 instead of 720x432), Touch Buttons forced as the default control scheme on first run, and Circle no longer opening the pause menu mid-race (Start already did that, so the overlap was removed).
 * This is a Beta! You might encounter occasional UI quirks or unmapped buttons in very specific sub-menus. 
 * Performance is mostly solid, but some heavy tracks might experience slight frame drops. Further optimizations are planned.
 * The intro trailer needs its `.mp4` present in `ux0:data/asphalt5/data/` — otherwise it is skipped.

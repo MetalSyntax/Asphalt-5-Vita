@@ -331,8 +331,11 @@ static void poll_keys(void * env, void * clazz) {
     if (state == APP_STATE_INGAME) {
         // IN-GAME Mapping -- every synthetic tap goes through the shared
         // slot allocator (fake_touch_set), never a hardcoded slot.
-        bool left_down = (pad.buttons & SCE_CTRL_LEFT) != 0 || (pad.buttons & SCE_CTRL_LTRIGGER) != 0;
-        bool right_down = (pad.buttons & SCE_CTRL_RIGHT) != 0 || (pad.buttons & SCE_CTRL_RTRIGGER) != 0;
+        // Left analog stick steers too (deadzone matches the menu's pad.ly
+        // threshold below) -- the D-pad/L/R mapping alone left the stick
+        // completely unused for driving.
+        bool left_down = (pad.buttons & SCE_CTRL_LEFT) != 0 || (pad.buttons & SCE_CTRL_LTRIGGER) != 0 || pad.lx < 64;
+        bool right_down = (pad.buttons & SCE_CTRL_RIGHT) != 0 || (pad.buttons & SCE_CTRL_RTRIGGER) != 0 || pad.lx > 192;
         bool cross_down = (pad.buttons & SCE_CTRL_CROSS) != 0;
         bool square_down = (pad.buttons & SCE_CTRL_SQUARE) != 0;
         bool start_down = (pad.buttons & SCE_CTRL_START) != 0;
@@ -388,8 +391,11 @@ static void poll_keys(void * env, void * clazz) {
         #undef DISPATCH_KEY
     }
 
-    // Default universal BACK button (Circle) for menus
-    bool circle_down = (pad.buttons & SCE_CTRL_CIRCLE) != 0;
+    // BACK button (Circle) for menu navigation only -- NOT in-game. Android's
+    // BACK also opens the pause menu from GS_Run, which duplicated exactly
+    // what START (FAKE_IDX_START, tapping the pause icon) already does; the
+    // user asked for that overlap gone since START already covers it.
+    bool circle_down = state != APP_STATE_INGAME && (pad.buttons & SCE_CTRL_CIRCLE) != 0;
     if (circle_down != s_circle_was_down) {
         s_circle_was_down = circle_down;
         if (circle_down && s_key_down) s_key_down(env, clazz, 4 /* KEYCODE_BACK */);

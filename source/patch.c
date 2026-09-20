@@ -124,6 +124,34 @@ static int hook_BaseSoundManager_ret0() {
     return 0;
 }
 
+/*
+ * CGameSettings::Reset() -- called by CGameSettings::Init() on every single
+ * boot, and again by Game::ResetData() whenever there's no valid data.sav to
+ * load. Confirmed in decompiled pseudo-C that BOTH CGameSettings::Reset() and
+ * the lazy-singleton constructor CGameSettings::CGameSettings() hardcode
+ * `this+4` (ControlMode) to 1 -- Tilt-to-steer is the factory default, not
+ * Touch Buttons. Every synthetic tap our own physical-control forwarding
+ * (source/input.c) sends is calibrated against the fixed on-screen positions
+ * of the Touch Buttons scheme (control mode 0); in any other mode those same
+ * coordinates land on the wrong icon or nothing at all, which is exactly the
+ * "nitro/brake buttons still visible and physical controls flaky" symptom
+ * reported after a fresh install. A real save always wins: right after
+ * Reset() runs at boot, CGameSettings::Load() freads `this+4` straight from
+ * disk when data.sav exists and is valid, unconditionally overwriting
+ * whatever we force here -- so this only changes the outcome the very first
+ * time the port runs, before any save exists, never a player's own later
+ * choice from the in-game options menu.
+ */
+static so_hook s_hook_cgamesettings_reset;
+static void (* p_CGameSettings_SetControlMode)(void *, int);
+
+static void hook_CGameSettings_Reset(void *this_) {
+    int r = SO_CONTINUE(int, s_hook_cgamesettings_reset, this_);
+    (void) r;
+    if (p_CGameSettings_SetControlMode)
+        p_CGameSettings_SetControlMode(this_, 0);
+}
+
 #ifdef ENABLE_PERF_TELEMETRY
 /*
  * Diagnostic-only: bracket the 4 top-level per-frame phases confirmed in
@@ -225,6 +253,14 @@ void so_patch(void) {
     hook_addr((uintptr_t) so_symbol(&so_mod, "_ZN16BaseSoundManager19stopAllSecondMusicsEv"), (uintptr_t) &hook_BaseSoundManager_stopAllSounds);
     hook_addr((uintptr_t) so_symbol(&so_mod, "_ZN16BaseSoundManager6updateEi"), (uintptr_t) &hook_BaseSoundManager_ret0);
     hook_addr((uintptr_t) so_symbol(&so_mod, "_ZN16BaseSoundManager14isSoundPlayingEiii"), (uintptr_t) &hook_BaseSoundManager_isSoundPlaying);
+
+    // Default to Touch Buttons (control mode 0) instead of the engine's own
+    // Tilt-to-steer factory default -- see the comment above
+    // hook_CGameSettings_Reset() for why.
+    p_CGameSettings_SetControlMode = (void (*)(void *, int))
+            so_symbol(&so_mod, "_ZN13CGameSettings14SetControlModeEi");
+    s_hook_cgamesettings_reset = hook_addr(
+            (uintptr_t) so_symbol(&so_mod, "_ZN13CGameSettings5ResetEv"), (uintptr_t) &hook_CGameSettings_Reset);
 
 #ifdef ENABLE_PERF_TELEMETRY
     // Was previously missing entirely -- hook_Scene_* were defined above but

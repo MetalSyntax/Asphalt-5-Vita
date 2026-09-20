@@ -118,7 +118,7 @@ void gl_init() {
  * edge can never produce an out-of-range viewport/scissor rect for GXM --
  * that combination (undersized real framebuffer + an unclamped rescaled
  * rect) was the leading suspect for the GPU crash in the reverted Bug #8
- * attempt. 720/800 and 432/480 both reduce to exactly 9/10, so this is exact
+ * attempt. OFFSCREEN_W/H == SCREEN_W/H (both 800x480), so this is exact
  * (no rounding at all) for the common full-screen case and any rect whose
  * edges are multiples of 10 in engine space.
  */

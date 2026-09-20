@@ -2123,6 +2123,20 @@ bonificaciones -- `CCar::AddNitro`, `NITRO_POWERUP` -- y no está disponible has
 el jugador tocaba antes de tener nitro cargado, no pasa nada y es 100% esperado, no un bug).
 **Pendiente:** una respuesta del usuario para diferenciar ambos casos antes de tocar más código acá.
 
+**Pista nueva del usuario (2026-09-20):** reporta que CRUZ sigue necesitando varios toques para
+activar nitro, EXCEPTO si justo antes se hace SQUARE (drift/freno) y recién ahí CRUZ -- esa
+combinación sí prende a la primera. Con los físicos (D-pad/CRUZ/SQUARE), `fake_touch_evict_for()`
+(bug #27 original) desaloja el slot de SQUARE apenas CRUZ lo pide si los 2 cupos están ocupados --
+si SQUARE ya estaba sostenido (drift), hay un slot para desalojar de inmediato y CRUZ lo consigue
+en el mismo frame. Con dedo real sobre el táctil (`poll_touch()`) no hay ninguna lógica de
+desalojo -- son slots libres/ocupados por dedos reales sin ninguna prioridad. Esto es consistente
+con la eviction funcionando bien para el camino físico, pero no explica por qué CRUZ solo, sin
+SQUARE antes, sigue fallando incluso viniendo del D-pad/físico (ahí SQUARE no estaría ocupando
+ningún slot para empezar). Sigue pendiente un log de consola real reproduciendo exactamente "CRUZ
+solo" vs. "SQUARE y después CRUZ" (ambos con controles físicos) para aislar si el segundo cupo está
+quedando ocupado por otra cosa (¿LEFT/RIGHT sostenido por el giro en la curva, como en el bug
+original?) cuando falla.
+
 ### Bug #28 -- CONFIRMADO Y CORREGIDO: `Asphalt5.Exit()` era un stub vacío -- la app nunca podía cerrarse
 
 **Reportado por el usuario:** "no puedo... salirme completamente del juego que debería de cerrar la app."
@@ -2184,3 +2198,65 @@ caigan sobre el ítem equivocado de la lista de pausa).
 
 **Pendiente:** desplegar el build con la instrumentación, reproducir "entrar a pausa -> Menú
 Principal -> confirmar", y mandar el log nuevo.
+
+### Feature -- stick analógico izquierdo mapeado a dirección (además de D-pad/L/R)
+
+**Pedido por el usuario:** mapear otros tipos de controles físicos existentes.
+
+**Cambio (`source/input.c`):** el analógico izquierdo (`pad.lx`) no se leía para nada en la rama
+`APP_STATE_INGAME` de `poll_keys()` -- solo D-pad y LTRIGGER/RTRIGGER doblaban. Agregado
+`pad.lx < 64` / `pad.lx > 192` como condición extra de `left_down`/`right_down`, mismo umbral de
+deadzone que ya usaba la rama de menú para `pad.ly` (arriba/abajo). Va por el mismo
+`fake_touch_set(FAKE_IDX_LEFT/RIGHT, ...)` que el resto, sin tocar la lógica de slots/eviction del
+bug #27.
+
+**Verificado:** compila limpio (`psvita-toolkit build --preset release`). Falta confirmar en
+consola que el analógico dobla el auto de forma pareja al D-pad (sin doble input raro si se usan
+ambos a la vez, ya que `left_down`/`right_down` son simplemente un OR).
+
+### Bug -- causa raíz de "los botones de freno/nitro siguen ahí y los físicos fallan": el modo de control por defecto del motor es Tilt, no Touch Buttons
+
+**Reportado por el usuario:** después de instalar, seguía viendo los íconos de freno/nitro en
+pantalla y los controles físicos no se sentían confiables.
+
+**Causa raíz (confirmada en pseudo-C):** el juego real tiene 4 esquemas de control
+(`CGameSettings::GetControlMode()` 0-3: Touch Buttons, Tilt, y 2 variantes de arrastre). TANTO
+`CGameSettings::CGameSettings()` (constructor lazy-singleton) COMO `CGameSettings::Reset()`
+hardcodean `this+4` (ControlMode) = **1 (Tilt)** como default de fábrica -- confirmado en las dos
+funciones del `.so`. `CGameSettings::Init()` llama `Reset()` en TODO arranque del juego, antes de
+que `Game::LoadData()` intente leer `data.sav`. O sea: en una instalación nueva (sin save), el motor
+arranca en modo Tilt, no Touch Buttons.
+
+Todo el forwarding de controles físicos de este port (`source/input.c`) simula toques en las
+coordenadas EXACTAS de los íconos del esquema Touch Buttons (modo 0) -- confirmado en
+`GS_Run::InitialiseButtons()`/`GS_Run::Render()` que cada modo posiciona (o esconde) sus botones en
+coordenadas distintas. En modo Tilt, el ícono de nitro se reubica a
+`(OS_SCREEN_W-0x23, OS_SCREEN_H-0x55)`, muy lejos de donde nuestro CRUZ físico apunta -- eso explica
+tanto los íconos "de más" en pantalla como que los físicos no respondan igual de bien.
+
+**Fix (`source/patch.c`):** hook sobre `CGameSettings::Reset()` (`_ZN13CGameSettings5ResetEv`) que,
+después de dejar correr el original sin tocarlo (`SO_CONTINUE`), fuerza
+`CGameSettings::SetControlMode(this, 0)`. Como `CGameSettings::Load()` lee `this+4` directo del
+`data.sav` real cuando existe uno válido (confirmado, `fread(this+4,1,1,param_1)` en el pseudo-C) y
+eso corre DESPUÉS de `Reset()` en el arranque, un save real sigue ganando siempre -- esto solo
+cambia el resultado la primerísima vez que se corre el port, antes de que exista cualquier save, sin
+pisar una elección posterior del jugador desde el menú de opciones.
+
+**Verificado:** compila limpio. Falta confirmar en consola que: (a) en una instalación limpia
+(`data.sav` borrado) el juego arranca directo en Touch Buttons sin tocar el menú de opciones, y (b)
+que forzar el modo no rompe nada si el jugador después cambia a otro esquema desde el menú (los
+físicos simplemente dejarían de responder ahí, como ya se documentó en el README).
+
+### Feature -- Círculo ya no abre el menú in-game (duplicaba a Start)
+
+**Pedido por el usuario:** quitar que Círculo abra el menú, ya que Start (que simula el tap sobre el
+ícono de pausa) ya cumple esa función.
+
+**Cambio (`source/input.c`):** Círculo mandaba `KEYCODE_BACK` sin importar el estado
+(`APP_STATE_INGAME`/`MENU`/`TITLE`) -- durante la carrera eso dispara la pausa igual que Start,
+duplicando la función. Ahora `circle_down` solo se arma fuera de `APP_STATE_INGAME`, así Círculo
+sigue funcionando como "atrás" dentro de los menúes (navegación, cancelar diálogos) pero ya no abre
+el menú de pausa durante la carrera.
+
+**Verificado:** compila limpio. Falta confirmar en consola que Start sigue abriendo pausa
+normalmente y que Círculo ya no lo hace en carrera, sin afectar la navegación "atrás" en menúes.

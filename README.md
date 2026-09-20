@@ -43,23 +43,64 @@ Since this is a Beta release, keep in mind:
   (`nativeGetJNIEnv` → `GLResLoader`/`GLMediaPlayer` init → `Asphalt5_nativeInit` →
   `Asphalt5Renderer_nativeInit`) matching the real Android `onSurfaceCreated()` order.
 - **vitaGL Graphics Pipeline**: GLES 1.1 fixed-function rendering, with an internal
-  720x432 offscreen FBO downsampled to the native 960x544 panel (menu layout still
+  800x480 offscreen FBO upscaled to the native 960x544 panel (menu layout still
   reports 800x480 to the engine so UI scaling stays correct).
 - **Audio**: Custom 32-bit fixed-point audio mixer with linear interpolation running on the `MAIN` audio port.
   It honors the engine's loop/pitch/volume/stop commands: looped engine sounds track RPM via live pitch updates,
   long music tracks get a dedicated unstolen voice (mirroring the engine's `nativePlaySoundBig` path), one-shot
   SFX live in a 16-voice pool that prefers stealing one-shots over loops, and the master bus uses gain compensation
   (`1/sqrt(N)`) plus a soft limiter instead of hard clipping.
-- **Input**: Full physical button support! D-Pad/Analog for menus, and full steering/pedal support during races.
-  The router is state-aware (title / menu / in-race): synthetic touches share the same 2-slot allocator as real
-  fingers so they can never collide, held buttons are cleanly released on state transitions (no stuck "ghost"
-  fingers after a race), and on post-race results screens Cross sends both a center-tap (which is what those
-  screens actually listen for) and DPAD_CENTER.
+- **Input**: Full physical button support! D-Pad/Analog stick for menus and steering, Cross for nitro, Square for
+  brake, Start opens the pause/in-game menu, Circle is BACK in menus only. The router is state-aware
+  (title / menu / in-race): synthetic touches share the same 2-slot allocator as real fingers so they can never
+  collide, held buttons are cleanly released on state transitions (no stuck "ghost" fingers after a race), and on
+  post-race results screens Cross sends both a center-tap (which is what those screens actually listen for) and
+  DPAD_CENTER. **Physical controls only work with the "Touch Buttons" control scheme** — see
+  [Controls](#-controls) below.
 - **Assets from `ux0:`**: Resource loader reads game assets/chunks from `ux0:data/asphalt5/`
   with an LRU cache to reduce SD card stutter.
 
+### 🕹️ Controls
+
+The original game has **four** selectable control schemes in its in-game options menu (Options →
+Controls): **Touch Buttons**, **Tilt to Steer**, and two touch-drag variants. This port's physical
+button/D-Pad/analog-stick mapping (`source/input.c`) works by simulating taps at the exact screen
+coordinates of the **Touch Buttons** on-screen icons — it does **not** read the Vita's motion
+sensors, and it does **not** emulate a finger dragging across the screen. As a result:
+
+- ✅ **Touch Buttons** is the only control scheme physical controls work with. This is now forced
+  automatically **the very first time you run the port** (before any save file exists) — you don't
+  need to change anything in the options menu on a fresh install.
+- ❌ **Tilt to Steer** and the two drag-to-steer schemes do **not** work with physical controls and
+  should **not** be selected from the options menu — steering (and depending on the scheme, nitro/
+  brake too) will not respond correctly if you do, since the physical-input code is aiming at
+  on-screen positions that don't apply to those schemes.
+- If you ever switch control schemes yourself (or restore a save from the Android version) and
+  controls stop responding, go back to **Options → Controls → Touch Buttons**.
+- The on-screen Touch Buttons icons (steering arrows, nitro, brake) are still drawn — you can
+  ignore them and use the physical controls below, or tap them directly, both work simultaneously.
+
+| Vita input | Action |
+|---|---|
+| D-Pad Left/Right, L/R, or Left Stick | Steer |
+| Cross | Nitro |
+| Square | Brake |
+| Start | Pause / in-game menu |
+| Circle | Back (menus only — not in-race, so it doesn't overlap with Start) |
+
 ### ⚠️ Known Issues
 
+- **Touch Buttons icons still visible, and Nitro (Cross) often needs several presses**: the on-screen
+  brake/nitro icons are drawn even though physical controls work, and Cross frequently needs multiple
+  presses before Nitro fires — **except** doing Square (brake/drift) immediately before Cross, which
+  reliably triggers Nitro on the very first try. Root cause not isolated yet — see the Bug #27
+  follow-up in [`port_progress.md`](port_progress.md); a console log capturing the drift-then-nitro
+  pattern specifically is the next thing needed to actually fix it instead of guessing.
+- **Recent, not yet hardware-confirmed changes**: left analog stick steering, higher internal render
+  resolution (800x480 instead of 720x432, for a sharper image), Touch Buttons forced as the default
+  control scheme the first time the port runs (see [Controls](#-controls) above), and Circle no
+  longer opening the pause menu mid-race (Start already does that). All build clean but are pending
+  confirmation on real hardware — see `port_progress.md` for details.
 - **Audio quirks**: Mostly resolved (loops, music, pitch, stop handling — see above). If a specific track still
   sounds off, grab a console log: audio loads and voice events are logged with the `sndId` needed to trace it.
 - **Beta bugs**: Unmapped physical buttons in very specific sub-menus or rare cache trashing between
