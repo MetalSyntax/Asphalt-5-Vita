@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Title%20ID-ASPHALT05-ff69b4.svg?style=flat-square" alt="Title ID ASPHALT05" />
   <img src="https://img.shields.io/badge/Engine-Gameloft%20Proprietary-brightgreen.svg?style=flat-square" alt="Engine" />
   <img src="https://img.shields.io/badge/Renderer-vitaGL%20%28GLES%201.1%29-orange.svg?style=flat-square" alt="Renderer" />
-  <img src="https://img.shields.io/badge/Status-Playable%20(Beta)-success.svg?style=flat-square" alt="Status: Playable" />
+  <img src="https://img.shields.io/badge/Status-Playable%20(v1.0)-success.svg?style=flat-square" alt="Status: Playable" />
 </p>
 
 ---
@@ -27,13 +27,35 @@ dynamic loader (*soloader*) and an Android environment emulation layer (*FalsoJN
 with [vitaGL](https://github.com/Rinnegatamante/vitaGL) providing the GLES 1.1
 fixed-function rendering backend.
 
-### 🎮 Current Status: Playable (Beta)
+### 🎮 Current Status: Playable (v1.0)
 
-The game **is fully playable from start to finish**. Extensive work has gone into diagnosing and fixing several performance bottlenecks (synchronous SD card I/O, cache thrashing, soft-float audio overhead). See [`port_progress.md`](port_progress.md) for the full bug-by-bug history. 
+The game **is fully playable from start to finish** with physical controls, full audio and
+cutscene video. This is the first non-beta release. See
+[`port_progress.md`](port_progress.md) for the full bug-by-bug history, and
+[`RELEASE.md`](RELEASE.md) for the release notes.
 
-Since this is a Beta release, keep in mind:
-* Audio is working and has been heavily optimized (fixed-point math, linear interpolation), but still has some minor quirks and room for improvement.
-* There may be other undiscovered bugs or occasional UI glitches.
+### 🔧 Fixed since the Beta
+
+- **Nitro fires on a single press** of Cross (or a tap on the icon), whether or not you're
+  steering at the same time. The engine only registers a nitro press during a 25 Hz game-logic
+  step, and on the Vita some render frames run none, so the press was dropped. It now stays
+  queued until the car logic reads it (Bugs #27/#29).
+- **The drift skid no longer keeps playing after the drift ends.** A wrong argument in the
+  sound-state bridge meant the engine thought the skid had already stopped, so it never sent the
+  stop (Bug #30).
+- **Race music no longer plays twice at once.** The song was started both on the dedicated music
+  voice and on a regular SFX voice (Bug #31).
+- **Scenery ambient loops tamed.** Some tracks have animated scenery objects that loop a 13–14 s
+  "revving + skidding" clip at full volume from far away. That clip now fades out much faster with
+  distance and never goes above 50% volume.
+- **Brake and nitro on-screen icons at ~1% opacity** (the physical buttons drive them). Press
+  **SELECT** during a race to show them again, or hide them again.
+- **Exit actually closes the app** from the pause menu and the main menu (Bug #28).
+- **Intro/cutscene video at ~30 FPS** instead of ~10 (Bug #25).
+- **No screen-off freeze** while idling in menus (Bug #26).
+- **Left analog stick steers**, the internal render resolution is sharper (800x480 instead of
+  720x432), Touch Buttons is the default control scheme on a fresh install, and Circle no longer
+  duplicates Start's pause mid-race.
 
 ### ✨ What Works
 
@@ -77,8 +99,9 @@ sensors, and it does **not** emulate a finger dragging across the screen. As a r
   on-screen positions that don't apply to those schemes.
 - If you ever switch control schemes yourself (or restore a save from the Android version) and
   controls stop responding, go back to **Options → Controls → Touch Buttons**.
-- The on-screen Touch Buttons icons (steering arrows, nitro, brake) are still drawn — you can
-  ignore them and use the physical controls below, or tap them directly, both work simultaneously.
+- The on-screen brake and nitro icons are drawn at ~1% opacity by default, since the physical
+  buttons drive them. Press **SELECT** in-race to show or hide them. Tapping the screen still
+  works either way, so touch and physical controls can be used together.
 
 | Vita input | Action |
 |---|---|
@@ -86,28 +109,19 @@ sensors, and it does **not** emulate a finger dragging across the screen. As a r
 | Cross | Nitro |
 | Square | Brake |
 | Start | Pause / in-game menu |
+| Select | Show / hide the on-screen brake & nitro icons (in-race) |
 | Circle | Back (menus only — not in-race, so it doesn't overlap with Start) |
 
 ### ⚠️ Known Issues
 
-- **Touch Buttons icons still visible, and Nitro (Cross) often needs several presses**: the on-screen
-  brake/nitro icons are drawn even though physical controls work, and Cross frequently needs multiple
-  presses before Nitro fires — **except** doing Square (brake/drift) immediately before Cross, which
-  reliably triggers Nitro on the very first try. Root cause not isolated yet — see the Bug #27
-  follow-up in [`port_progress.md`](port_progress.md); a console log capturing the drift-then-nitro
-  pattern specifically is the next thing needed to actually fix it instead of guessing.
-- **Recent, not yet hardware-confirmed changes**: left analog stick steering, higher internal render
-  resolution (800x480 instead of 720x432, for a sharper image), Touch Buttons forced as the default
-  control scheme the first time the port runs (see [Controls](#-controls) above), and Circle no
-  longer opening the pause menu mid-race (Start already does that). All build clean but are pending
-  confirmation on real hardware — see `port_progress.md` for details.
-- **Audio quirks**: Mostly resolved (loops, music, pitch, stop handling — see above). If a specific track still
-  sounds off, grab a console log: audio loads and voice events are logged with the `sndId` needed to trace it.
-- **Beta bugs**: Unmapped physical buttons in very specific sub-menus or rare cache trashing between
-  the asset cache and the GPU resource pool, and vitaGL vertex pool pressure —
-  see the bug log in [`port_progress.md`](port_progress.md) (Bugs #9, #16–#22).
-- **Video playback**: The intro trailer plays via the FFmpeg software decoder when the `.mp4` is present in
-  `ux0:data/asphalt5/data/`; if the file is missing/unreadable it is skipped instantly instead of hanging.
+- **Only the Touch Buttons control scheme** works with physical controls (see
+  [Controls](#-controls)).
+- **Manual standby** with the power button (sleep/resume mid-game) is untested. Idling is safe.
+- **Heavy tracks** may drop a few frames at busy moments.
+- **Video playback** needs the intro `.mp4` in `ux0:data/asphalt5/data/`. If it's missing, the
+  video is skipped instantly instead of hanging.
+- If a sound ever seems off, grab a console log. Every new voice is logged as
+  `[audio] start sndId=...`, which identifies the exact sound.
 
 ---
 

@@ -2260,3 +2260,136 @@ el menú de pausa durante la carrera.
 
 **Verificado:** compila limpio. Falta confirmar en consola que Start sigue abriendo pausa
 normalmente y que Círculo ya no lo hace en carrera, sin afectar la navegación "atrás" en menúes.
+
+### Bug #29 -- CONFIRMADO POR ANÁLISIS Y CORREGIDO: el nitro solo funciona si a la vez se está doblando
+
+**Reportado por el usuario:** "el nitro no funciona a menos que también estés doblando" (continuación
+del bug #27: CRUZ solo falla; SQUARE/giro + CRUZ sí prende).
+
+**Causa raíz (pseudo-C + desensamblado, no el forwarding de input):**
+
+1. `Game::TimerCallback()` llama `GamePadManager::Update()` **una vez por frame de render** y
+   después corre la lógica con paso fijo de 25 Hz: `while (acc > 0x27) { InitFrame(); state->Update(); ... }`.
+   Un frame de render de menos de 40 ms puede correr **cero** pasos de lógica.
+2. `GS_Run::Update()` recorre sus rects y, mientras el rect de nitro (id 1, el ícono cuyo sprite cambia
+   `0x1a1a`/`0x1b19` según la carga) está presionado, llama `GamePad::KeyboardKeyPressed(0x4000)` en
+   cada paso.
+3. `GamePad::KeyboardUpdateKeys()` genera el flanco de un frame: `edge = ~(edge|held) & pressed`, y
+   `GamePadManager::UpdateKeysState()` lo copia a `manager+8`. `Scene::UpdateCars()` dispara el nitro
+   SOLO con ese flanco: `(manager+8 & 0x4000) && !(held & 4)` -> flag `0x20` -> `CCar::UpdateNitro`.
+4. Si el frame que latchea el flanco no corre ningún paso, el `Update()` del frame siguiente calcula
+   `edge = 0` (la tecla ya está en `held`) y el toque se pierde para siempre. En Android el juego corría
+   a <=25 fps y siempre había >=1 paso; en la Vita (`vglSwapBuffers(GL_FALSE)`, sin vsync) se renderiza
+   más rápido.
+5. Por qué doblar lo "arreglaba": los rects de flechas (ids 6/7) y el de freno (3/9) van por
+   `CKeyQueue::AddKeyToQueue()`, que llama `GamePadManager::Update()` **en medio del paso** -- después
+   de procesar el rect de nitro y antes de `Scene::Update()` -- así que el flanco se latchea dentro de un
+   paso que sí llega a `UpdateCars`. Coincide exactamente con la pista del usuario (SQUARE/giro + CRUZ
+   funciona, CRUZ solo no).
+
+**Fix (`source/patch.c`):** hook sobre `GamePadManager::Update()` (`_ZN14GamePadManager6UpdateEv`,
+`SO_CONTINUE` al original sin tocarlo) que mantiene vivo el bit de nitro (`0x4000`) en `manager+8`
+hasta que un `Scene::UpdateCars()` efectivamente corra (el hook de `UpdateCars` ahora se instala
+siempre, no solo con telemetría, y marca el consumo). Solo aplica con `GS_Run` arriba del stack
+(`input_in_race()`, nuevo en `source/input.c`) para no repetir flancos en menúes, y con tope de 8
+arrastres por si alguna fase de `GS_Run` no actualiza autos. Doble disparo no es posible: si hay 2
+pasos en el mismo frame, `CCar::UpdateNitro` ya descarta el segundo (`Game+0x420` igual -> diferencia
+< 100 ms), igual que en el motor original.
+
+**Verificado:** compila limpio (`psvita-toolkit build --preset release`, con y sin el bloque de
+telemetría). **Pendiente:** confirmar en consola que CRUZ solo (sin doblar ni frenar) prende nitro al
+primer toque.
+
+**Nota abierta (no tocada acá):** según `GS_Run::InitialiseButtons()`/`GS_Run::Update()`, el modo 0
+es el que muestra el volante (rect 0, `Scene::UpdateWheelPosition`) y deshabilita las flechas 6/7,
+mientras que el modo 2 es el que usa flechas vía `CKeyQueue`. Vale la pena revisar si el
+`SetControlMode(0)` forzado en `hook_CGameSettings_Reset()` es realmente el esquema "Touch Buttons".
+
+### Bug #30 -- CONFIRMADO Y CORREGIDO: el sonido del drift queda sonando al terminar el drift hasta pausar
+
+**Reportado por el usuario:** "a veces el audio del drift se queda pegado después de terminar el drift
+hasta que pausás y reanudás".
+
+**Causa raíz:** `hook_BaseSoundManager_isSoundPlaying(this, a, sndId, b)` usaba el **2do** int como
+sndId. La firma real es `isSoundPlaying(this, soundId, instance, package)` -- confirmado en el
+pseudo-C (`param_1 * 0x18` indexa la tabla de sonidos) y en los llamadores
+(`SoundManager::SamplePlaying(id)` hace `isSoundPlaying(id, i, pkg)` para `i = 0..instancias-1`;
+`isSoundPlaying(musicId, 0, 0)` en el menú). O sea, `SamplePlaying(X)` en realidad respondía "¿está
+sonando el sonido #0?". `CCar::UpdateDrift()` solo llama `SampleStop(0x78)` (loop del derrape) si
+`SamplePlaying(0x78) != -1`, así que el loop seguía sonando hasta que la pausa hacía `stopAllSfx`; el
+"a veces" es cuando el sonido #0 justo estaba vivo y el stop sí pasaba.
+
+**Fix (`source/patch.c`):** el hook toma `(this, sndId, instance, package)` y consulta `sndId`. Efecto
+colateral esperado y correcto: los `if (SamplePlaying(X) == -1) SampleStart(X)` del motor (p. ej. el
+arranque del loop de drift, `0x97` al abrir la pausa) ahora ven el estado real.
+
+**Verificado:** compila limpio. **Pendiente:** confirmar en consola que el skid se corta al salir del
+drift sin tener que pausar.
+
+### Bug #29/#30 -- CONFIRMADOS EN CONSOLA (`logs/asphalt5_076.log`)
+
+Reporte del usuario: el nitro funciona con un solo toque y el skid ya no se queda pegado.
+
+### Feature -- botones de freno y nitro al ~1% de opacidad
+
+**Pedido por el usuario:** que los íconos de freno y nitro casi no se vean (1%), sin ocultar el resto del HUD.
+
+**Cambio (`source/patch.c`):** `GS_Run::Render()` primero llama `Scene::Render()` y después pinta
+los botones con `Sprite::PaintFrame(spr, frame, (int)rect.x0, (int)rect.y0, 0)`. Nitro = rect id 1,
+freno = rect id 3 (abajo a la derecha) e id 9 (abajo a la izquierda). `Sprite::PaintFrame` ahora está
+reimplementado en C (el mismo loop que el original en `.so+0x77dec`, sin `SO_CONTINUE` porque se llama
+decenas de veces por frame). Cuando la llamada cae exactamente en el origen de uno de esos rects,
+estando dentro de `GS_Run::Render` pero fuera de `Scene::Render`, primero hace `Lib3D::Flush2D()` y
+después escala a `3/255` el alpha de los quads que acaba de agregar (colores RGBA8 en `Lib3D+0x12d8`,
+0x18 bytes por quad). Los rects táctiles no cambian. El hook de `Scene::Render` pasa a instalarse
+siempre. **Pendiente:** confirmar en consola (si el batch 2D no tuviera blending activo, los íconos se
+verían igual que antes).
+
+### Investigación -- loop de "acelerón + derrape" que suena solo (sin autos cerca)
+
+`asphalt5_076.log` no registra los play, solo las cargas. `raw_157` (12.9 s) y `raw_163` (14.4 s) se
+cargan recién en carrera, pero su envolvente (intro suave y después nivel alto sostenido) parece más
+música o un jingle que un skid. No se confirmó nada. **Instrumentado:** `audio_play_sound()` loguea
+`[audio] start sndId=... loop=... vol=... frames=...` cada vez que arranca una voz nueva, como mucho
+una vez por segundo por sndId. El log se escribe fuera de `gLock`. **Pendiente:** un log reproduciendo
+el sonido para identificar el sndId y su llamador.
+
+### Identificado (`logs/asphalt5_077.log`) -- el loop "acelerón + derrape" es un sonido ambiental del escenario
+
+Con la instrumentación nueva, `sndId=163` (14.4 s) arranca **una sola vez** con `loop=1 vol=1.00`
+a los 151.99 s (4.5 s después de empezar la carrera) y sigue en loop. Su envolvente es un siseo de
+unos 4 s y después un rugido grave de unos 10 s, que se repite. En la pista del log 076 le pasaba lo
+mismo a `raw_157`.
+
+**Origen confirmado:** `Scene::UpdateAnimatedObjectsSounds()` (`.so+0x9dddc`). Recorre los objetos
+animados de la pista de tipo `0x62`/`0x65`, guarda la distancia mínima cámara-objeto por sndId (tabla
+en `Scene+0x18c70`) y, para los ids `0x92..0xba`, si `d <= 10000` hace `SampleStart(id, loop=1)` +
+`setVolumeSoundId(id, SoundVolume * (1 - d/10000))`. Si la distancia es mayor y el sonido había
+arrancado, lo detiene. La caída es lineal, así que a 5000 unidades todavía suena al 50%. En Android
+`CSound::SetPosition` es un no-op, así que no hay otro 3D.
+
+**Ajuste pedido por el usuario ("Atenuar más"):** hook sobre `Scene::UpdateAnimatedObjectsSounds`
+que marca un alcance (`audio_set_ambient_scope`). Dentro de ese alcance, `audio_play_sound` arranca el
+loop en volumen 0 y `GLMediaPlayer_setVolume` transforma el volumen con `0.5 * v^2` (caída
+cuadrática, tope del 50%). No afecta ningún otro sonido.
+
+### Bug #31 -- CONFIRMADO EN LOG Y CORREGIDO: la música de carrera sonaba duplicada
+
+`asphalt5_077.log`: `playSoundBig: sndId=7` y, 56 ms después, `start sndId=7 loop=0` en una voz del
+pool. Eran dos copias de la canción de 105 s superpuestas. **Fix (`source/audio.cpp`):**
+`audio_play_sound` ignora el sndId si ya está sonando en la voz grande (`gBig`), y
+`audio_play_sound_big` libera cualquier voz del pool que tenga ese mismo sndId.
+
+### Feature -- SELECT muestra/oculta los íconos de freno y nitro en carrera
+
+**Pedido por el usuario:** un botón sin uso para volver a mostrar los controles en pantalla.
+**Cambio:** en `source/input.c`, el flanco de SELECT durante `APP_STATE_INGAME` alterna
+`s_touch_buttons_visible` (arranca en falso, o sea atenuado) y lo expone vía
+`input_touch_buttons_visible()`. `hook_Sprite_PaintFrame` (`source/patch.c`) solo atenúa cuando
+está en falso.
+
+### Release v1.0 (fuera de beta)
+
+Confirmado por el usuario en consola: nitro con un solo toque, el skid ya no queda pegado y no
+reaparece el loop ambiental molesto. `RELEASE_BETA.md` pasa a llamarse `RELEASE.md` (v1.0) y el
+README se actualizó con todo lo corregido desde la beta.

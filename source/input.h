@@ -44,6 +44,12 @@ void input_init(fn_touch_evt pressed, fn_touch_evt moved, fn_touch_evt released,
 /** Poll touch + pad and fire the callbacks given to `input_init()`. Call once per frame. */
 void input_poll(void * env, void * clazz);
 
+/** Non-zero while the top-of-stack engine state is GS_Run (a race), as of the last `input_poll()`. */
+int input_in_race(void);
+
+/** Non-zero when the player toggled (SELECT, in-race) the on-screen brake/nitro icons back to full opacity. */
+int input_touch_buttons_visible(void);
+
 #ifdef __cplusplus
 };
 #endif

@@ -15,8 +15,11 @@
 #include <so_util/so_util.h>
 
 #include <psp2/kernel/processmgr.h>
+#include <stdbool.h>
+#include <stdint.h>
 #include <string.h>
 
+#include "input.h"
 #include "perf_telemetry_hooks.h"
 
 extern so_module so_mod;
@@ -115,8 +118,17 @@ static int hook_BaseSoundManager_stop4(void *this_, int soundId, int channel, in
     return 0;
 }
 
-static int hook_BaseSoundManager_isSoundPlaying(void *this_, int a, int sndId, int b) {
-    (void) this_; (void) a; (void) b;
+// isSoundPlaying(this, soundId, instance, package) -- confirmed in pseudo-C
+// (BaseSoundManager::isSoundPlaying indexes `param_1 * 0x18` into the sound
+// table, and SoundManager::SamplePlaying(id) loops `isSoundPlaying(id, i, pkg)`
+// over i = 0..instances-1). This used to read the 2nd int (the instance
+// index, always 0 on the first probe) as the sndId, so SamplePlaying(X) really
+// answered "is sound #0 playing?". CCar::UpdateDrift only calls
+// SampleStop(0x78) when SamplePlaying(0x78) != -1, so the looping drift skid
+// kept droning after the drift ended until pause's stopAllSfx cleared it --
+// and "sometimes" it did stop, whenever sound #0 happened to be live (Bug #30).
+static int hook_BaseSoundManager_isSoundPlaying(void *this_, int sndId, int instance, int package) {
+    (void) this_; (void) instance; (void) package;
     return audio_is_sound_playing(sndId);
 }
 
@@ -152,6 +164,193 @@ static void hook_CGameSettings_Reset(void *this_) {
         p_CGameSettings_SetControlMode(this_, 0);
 }
 
+/*
+ * Bug #29: nitro only fired while also steering.
+ *
+ * Game::TimerCallback() runs GamePadManager::Update() once per RENDER frame,
+ * then steps the game logic (GS_Run::Update -> Scene::Update ->
+ * Scene::UpdateCars) at a fixed 25 Hz -- `while (acc > 39ms)` -- so any
+ * render frame shorter than 40ms can run ZERO logic steps. GS_Run::Update
+ * turns the nitro rect (id 1) into GamePad::KeyboardKeyPressed(0x4000) every
+ * step it's held; the next GamePadManager::Update() latches that into the
+ * one-frame "pressed" edge (manager+8), and Scene::UpdateCars() only fires
+ * nitro on that edge (`(pressed & 0x4000) && !(held & 4)` -> CCar flag 0x20).
+ * If the frame that latched the edge runs no logic step, the next frame's
+ * Update() computes edge = ~(edge|held) & pressed = 0 (the key is already
+ * "held") and the press is gone for good -- the engine assumed Android's
+ * <=25fps, the Vita renders faster.
+ *
+ * Steering hid it: GS_Run's steering-arrow rects (ids 6/7) go through
+ * CKeyQueue::AddKeyToQueue(), which calls GamePadManager::Update() itself
+ * mid-step, AFTER the nitro rect was processed and BEFORE Scene::Update --
+ * latching the nitro edge inside a step that is guaranteed to reach
+ * UpdateCars. Same for the brake (SQUARE) path.
+ *
+ * Fix: keep the nitro edge alive across GamePadManager::Update() calls until
+ * a Scene::UpdateCars() actually runs, only while a race is on screen (menus
+ * never run UpdateCars and must not see repeated edges). Capped so a GS_Run
+ * phase that never updates cars can't hold it indefinitely.
+ */
+#define GAMEPAD_KEY_NITRO 0x4000
+#define NITRO_EDGE_MAX_CARRY 8
+
+static so_hook s_hook_gamepadmgr_update;
+static so_hook s_hook_scene_update_cars;
+static bool s_cars_updated = false;
+static uint32_t s_nitro_edge = 0;
+static int s_nitro_carries = 0;
+
+static int hook_GamePadManager_Update(void *this_) {
+    int r = SO_CONTINUE(int, s_hook_gamepadmgr_update, this_);
+    // GamePadManager: +4 GamePad*, +8 pressed edge, +0xc released, +0x10 held
+    // (GamePadManager::UpdateKeysState, confirmed in the disassembly).
+    uint32_t *pressed = (uint32_t *) ((uintptr_t) this_ + 8);
+    if (s_cars_updated || !input_in_race()) {
+        s_nitro_carries = 0;
+    } else if (s_nitro_edge && s_nitro_carries < NITRO_EDGE_MAX_CARRY) {
+        *pressed |= s_nitro_edge;
+        s_nitro_carries++;
+    }
+    s_nitro_edge = *pressed & GAMEPAD_KEY_NITRO;
+    s_cars_updated = false;
+    return r;
+}
+
+static int hook_Scene_UpdateCars(void *this_) {
+#ifdef ENABLE_PERF_TELEMETRY
+    perf_telemetry_phase_enter("Scene::UpdateCars");
+    SceUInt64 t0 = sceKernelGetProcessTimeWide();
+#endif
+    int r = SO_CONTINUE(int, s_hook_scene_update_cars, this_);
+#ifdef ENABLE_PERF_TELEMETRY
+    perf_telemetry_phase_exit("Scene::UpdateCars", sceKernelGetProcessTimeWide() - t0);
+#endif
+    s_cars_updated = true;
+    return r;
+}
+
+/*
+ * Brake + nitro on-screen buttons drawn at ~1% opacity (user request): the
+ * physical buttons drive them, so the icons only cover the road. Their touch
+ * rects are untouched -- only the vertex alpha of those sprites changes, and
+ * every other HUD element (pause, arrows, wheel...) is drawn as before.
+ *
+ * GS_Run::Render() (pseudo-C) first calls Scene::Render(), then paints its
+ * buttons with Sprite::PaintFrame(spr, frame, (int)rect.x0, (int)rect.y0, 0)
+ * -- nitro is gxMenu item/rect id 1 (the sprite that swaps 0x1a1a/0x1b19 with
+ * the nitro charge), brake is rect id 3 (bottom right) and id 9 (bottom left),
+ * both painted with item 3's frames. PaintFrame -> PaintFModule ->
+ * PaintModule -> Lib3D::paint2DModule() appends one quad (6 verts, RGBA8
+ * colors at Lib3D+0x12d8, 0x18 bytes/quad, count at Lib3D+0x12cc) to the 2D
+ * batch. So: while inside GS_Run::Render() but outside Scene::Render(), a
+ * PaintFrame landing exactly on one of those rects' origin gets its freshly
+ * appended quads' alpha scaled down. Flush2D() first so the batch can't
+ * wrap (flush at 0x80 quads) in the middle of the button.
+ *
+ * PaintFrame is reimplemented here (same loop as the original,
+ * .so+0x77dec) rather than SO_CONTINUE'd -- it runs dozens of times per
+ * frame and SO_CONTINUE costs two kernel memcpy+flushes per call.
+ */
+#define DIM_BUTTON_ALPHA 3 // of 255, ~1%
+#define DIM_MAX_RECTS 3
+
+typedef void (* fn_PaintFModule)(void *spr, int frame, int module, int x, int y,
+                                  unsigned flags, int a, int b, int c);
+typedef void (* fn_Flush2D)(void *lib3d);
+
+static fn_PaintFModule p_Sprite_PaintFModule;
+static fn_Flush2D p_Lib3D_Flush2D;
+static so_hook s_hook_gsrun_render;
+static so_hook s_hook_scene_render;
+static bool s_in_gsrun_render = false;
+static bool s_in_scene_render = false;
+static int s_dim_x[DIM_MAX_RECTS], s_dim_y[DIM_MAX_RECTS];
+static int s_dim_count = 0;
+
+static bool is_dim_button_origin(int x, int y) {
+    for (int i = 0; i < s_dim_count; i++)
+        if (s_dim_x[i] == x && s_dim_y[i] == y)
+            return true;
+    return false;
+}
+
+static void hook_Sprite_PaintFrame(void *spr, int frame, int x, unsigned y, int flags, int extra) {
+    if (frame < 0)
+        return;
+    int modules = (*(uint8_t **) ((uintptr_t) spr + 0x24))[frame];
+    if (modules == 0)
+        return;
+
+    bool dim = s_in_gsrun_render && !s_in_scene_render && p_Lib3D_Flush2D
+            && !input_touch_buttons_visible() && is_dim_button_origin(x, (int) y);
+    uint8_t *lib3d = *(uint8_t **) ((uintptr_t) spr + 0x70);
+    int first = 0;
+    if (dim) {
+        p_Lib3D_Flush2D(lib3d);
+        first = *(int *) (lib3d + 0x12cc);
+    }
+
+    for (int i = 0; i < modules; i++)
+        p_Sprite_PaintFModule(spr, frame, i, x, (int) y, (unsigned) flags, 0, 0, extra + 1);
+
+    if (dim) {
+        int last = *(int *) (lib3d + 0x12cc);
+        uint8_t *colors = *(uint8_t **) (lib3d + 0x12d8);
+        for (int q = first; q < last; q++)
+            for (int v = 0; v < 6; v++) {
+                uint8_t *a = &colors[q * 0x18 + v * 4 + 3];
+                *a = (uint8_t) ((*a * DIM_BUTTON_ALPHA) / 255);
+            }
+    }
+}
+
+static int hook_GS_Run_Render(void *this_) {
+    // gxGameState: +0x10 RectEntry*[] , +0x18 count; RectEntry: float x0,y0
+    // at +0/+4, id at +0x24 (gxGameState::FindRect / AddRectangle).
+    s_dim_count = 0;
+    int n = *(int *) ((uintptr_t) this_ + 0x18);
+    float **rects = *(float ***) ((uintptr_t) this_ + 0x10);
+    for (int i = 0; rects && i < n && s_dim_count < DIM_MAX_RECTS; i++) {
+        int id = *(int *) ((uintptr_t) rects[i] + 0x24);
+        if (id == 1 || id == 3 || id == 9) {
+            s_dim_x[s_dim_count] = (int) rects[i][0];
+            s_dim_y[s_dim_count] = (int) rects[i][1];
+            s_dim_count++;
+        }
+    }
+    s_in_gsrun_render = true;
+    int r = SO_CONTINUE(int, s_hook_gsrun_render, this_);
+    s_in_gsrun_render = false;
+    return r;
+}
+
+static int hook_Scene_Render(void *this_) {
+    s_in_scene_render = true;
+#ifdef ENABLE_PERF_TELEMETRY
+    perf_telemetry_phase_enter("Scene::Render");
+    SceUInt64 t0 = sceKernelGetProcessTimeWide();
+#endif
+    int r = SO_CONTINUE(int, s_hook_scene_render, this_);
+#ifdef ENABLE_PERF_TELEMETRY
+    perf_telemetry_phase_exit("Scene::Render", sceKernelGetProcessTimeWide() - t0);
+#endif
+    s_in_scene_render = false;
+    return r;
+}
+
+/*
+ * Scenery-object ambient loops (raw_157/raw_163 "revving + skid") --
+ * see audio_set_ambient_scope() in audio.cpp for the falloff reshaping.
+ */
+static so_hook s_hook_scene_anim_sounds;
+
+static int hook_Scene_UpdateAnimatedObjectsSounds(void *this_) {
+    audio_set_ambient_scope(1);
+    int r = SO_CONTINUE(int, s_hook_scene_anim_sounds, this_);
+    audio_set_ambient_scope(0);
+    return r;
+}
+
 #ifdef ENABLE_PERF_TELEMETRY
 /*
  * Diagnostic-only: bracket the 4 top-level per-frame phases confirmed in
@@ -165,8 +364,6 @@ static void hook_CGameSettings_Reset(void *this_) {
  * unmodified, only timing is added around it.
  */
 static so_hook s_hook_scene_update;
-static so_hook s_hook_scene_update_cars;
-static so_hook s_hook_scene_render;
 static so_hook s_hook_scene_render_interface;
 
 static int hook_Scene_Update(void *this_) {
@@ -174,22 +371,6 @@ static int hook_Scene_Update(void *this_) {
     SceUInt64 t0 = sceKernelGetProcessTimeWide();
     int r = SO_CONTINUE(int, s_hook_scene_update, this_);
     perf_telemetry_phase_exit("Scene::Update", sceKernelGetProcessTimeWide() - t0);
-    return r;
-}
-
-static int hook_Scene_UpdateCars(void *this_) {
-    perf_telemetry_phase_enter("Scene::UpdateCars");
-    SceUInt64 t0 = sceKernelGetProcessTimeWide();
-    int r = SO_CONTINUE(int, s_hook_scene_update_cars, this_);
-    perf_telemetry_phase_exit("Scene::UpdateCars", sceKernelGetProcessTimeWide() - t0);
-    return r;
-}
-
-static int hook_Scene_Render(void *this_) {
-    perf_telemetry_phase_enter("Scene::Render");
-    SceUInt64 t0 = sceKernelGetProcessTimeWide();
-    int r = SO_CONTINUE(int, s_hook_scene_render, this_);
-    perf_telemetry_phase_exit("Scene::Render", sceKernelGetProcessTimeWide() - t0);
     return r;
 }
 
@@ -262,16 +443,34 @@ void so_patch(void) {
     s_hook_cgamesettings_reset = hook_addr(
             (uintptr_t) so_symbol(&so_mod, "_ZN13CGameSettings5ResetEv"), (uintptr_t) &hook_CGameSettings_Reset);
 
+    // Bug #29: keep the nitro press edge alive until Scene::UpdateCars()
+    // consumes it -- see hook_GamePadManager_Update(). The UpdateCars hook
+    // doubles as the Scene::UpdateCars telemetry phase when that's enabled.
+    s_hook_gamepadmgr_update = hook_addr(
+            (uintptr_t) so_symbol(&so_mod, "_ZN14GamePadManager6UpdateEv"), (uintptr_t) &hook_GamePadManager_Update);
+    s_hook_scene_update_cars = hook_addr(
+            (uintptr_t) so_symbol(&so_mod, "_ZN5Scene10UpdateCarsEv"), (uintptr_t) &hook_Scene_UpdateCars);
+
+    s_hook_scene_anim_sounds = hook_addr(
+            (uintptr_t) so_symbol(&so_mod, "_ZN5Scene27UpdateAnimatedObjectsSoundsEv"),
+            (uintptr_t) &hook_Scene_UpdateAnimatedObjectsSounds);
+
+    // Brake/nitro buttons at ~1% opacity -- see hook_Sprite_PaintFrame().
+    p_Sprite_PaintFModule = (fn_PaintFModule) so_symbol(&so_mod, "_ZN6Sprite12PaintFModuleEiiiijiii");
+    p_Lib3D_Flush2D = (fn_Flush2D) so_symbol(&so_mod, "_ZN5Lib3D7Flush2DEv");
+    if (p_Sprite_PaintFModule)
+        hook_addr((uintptr_t) so_symbol(&so_mod, "_ZN6Sprite10PaintFrameEiiiji"), (uintptr_t) &hook_Sprite_PaintFrame);
+    s_hook_gsrun_render = hook_addr(
+            (uintptr_t) so_symbol(&so_mod, "_ZN6GS_Run6RenderEv"), (uintptr_t) &hook_GS_Run_Render);
+    s_hook_scene_render = hook_addr(
+            (uintptr_t) so_symbol(&so_mod, "_ZN5Scene6RenderEv"), (uintptr_t) &hook_Scene_Render);
+
 #ifdef ENABLE_PERF_TELEMETRY
     // Was previously missing entirely -- hook_Scene_* were defined above but
     // never installed, so Scene::Update()/UpdateCars()/Render()/
     // RenderInterface() ran unhooked and no PHASE_ENTER/PHASE_EXIT ever fired.
     s_hook_scene_update = hook_addr(
             (uintptr_t) so_symbol(&so_mod, "_ZN5Scene6UpdateEv"), (uintptr_t) &hook_Scene_Update);
-    s_hook_scene_update_cars = hook_addr(
-            (uintptr_t) so_symbol(&so_mod, "_ZN5Scene10UpdateCarsEv"), (uintptr_t) &hook_Scene_UpdateCars);
-    s_hook_scene_render = hook_addr(
-            (uintptr_t) so_symbol(&so_mod, "_ZN5Scene6RenderEv"), (uintptr_t) &hook_Scene_Render);
     s_hook_scene_render_interface = hook_addr(
             (uintptr_t) so_symbol(&so_mod, "_ZN5Scene15RenderInterfaceEv"), (uintptr_t) &hook_Scene_RenderInterface);
     s_hook_rendergroups = hook_addr(

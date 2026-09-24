@@ -68,6 +68,10 @@ static touch_slot   s_slots[MAX_TOUCH_SLOTS];
 static fn_touch_evt  s_pressed, s_moved, s_released;
 static fn_key_evt    s_key_down, s_key_up;
 static bool          s_circle_was_down = false;
+// SELECT (unused in-race) toggles the on-screen brake/nitro icons between
+// ~1% opacity (default -- physical buttons drive them) and fully visible.
+static bool          s_select_was_down = false;
+static bool          s_touch_buttons_visible = false;
 
 void input_init(fn_touch_evt pressed, fn_touch_evt moved, fn_touch_evt released,
                  fn_key_evt key_down, fn_key_evt key_up) {
@@ -354,6 +358,12 @@ static void poll_keys(void * env, void * clazz) {
         fake_touch_set(env, clazz, FAKE_IDX_CROSS, cross_down, 715, 380);
         fake_touch_set(env, clazz, FAKE_IDX_SQUARE, square_down, 50, 430);
         fake_touch_set(env, clazz, FAKE_IDX_START, start_down, 50, 50);
+        bool select_down = (pad.buttons & SCE_CTRL_SELECT) != 0;
+        if (select_down && !s_select_was_down) {
+            s_touch_buttons_visible = !s_touch_buttons_visible;
+            l_info("input: on-screen brake/nitro buttons %s", s_touch_buttons_visible ? "shown" : "dimmed");
+        }
+        s_select_was_down = select_down;
         s_fake_left_down = left_down;
         s_fake_right_down = right_down;
         s_fake_cross_down = cross_down;
@@ -406,4 +416,12 @@ static void poll_keys(void * env, void * clazz) {
 void input_poll(void * env, void * clazz) {
     poll_touch(env, clazz);
     poll_keys(env, clazz);
+}
+
+int input_in_race(void) {
+    return s_prev_state == APP_STATE_INGAME;
+}
+
+int input_touch_buttons_visible(void) {
+    return s_touch_buttons_visible;
 }

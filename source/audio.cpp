@@ -13,6 +13,7 @@
 
 #include <psp2/audioout.h>
 #include <psp2/kernel/threadmgr.h>
+#include <psp2/kernel/processmgr.h>
 #include <psp2/io/stat.h>
 
 #include <pthread.h>
@@ -595,8 +596,30 @@ static void voice_set_step(Voice *v, int rate, float pitch) {
     v->pitch = pitch;
 }
 
+/*
+ * Scene::UpdateAnimatedObjectsSounds() (pseudo-C + .so+0x9dddc) loops the
+ * track's scenery-object sounds (ids 0x92..0xba, e.g. raw_157/raw_163: a
+ * 13-14s "car revving + skidding" clip) whenever the camera is within 10000
+ * units of the object, at SoundVolume * (1 - d/10000) -- linear, so it is
+ * still at half volume 5000 units away and reads as a phantom car looping
+ * out of nowhere. Only while inside that function (main thread), volumes are
+ * reshaped to 0.5 * v^2 (quadratic falloff, 50% ceiling) and the loop starts
+ * silent so the engine's own setVolumeSoundId right after sets the level.
+ */
+static bool gAmbientScope = false;
+
+void audio_set_ambient_scope(int on) {
+    gAmbientScope = on != 0;
+}
+
+static float ambient_shape(float vol) {
+    return 0.5f * vol * vol;
+}
+
 void audio_play_sound(int sndId, int instance, float vol, float pitch, int loop) {
     if (!gAudioReady) return;
+    if (gAmbientScope)
+        vol = 0.0f;
 
     SfxSample *s = sfx_get(sndId);
     if (!s) return;
@@ -612,6 +635,14 @@ void audio_play_sound(int sndId, int instance, float vol, float pitch, int loop)
     }
 
     pthread_mutex_lock(&gLock);
+    // Already live on the dedicated music voice: never start a second copy
+    // in the pool. logs/asphalt5_077.log showed the race music (sndId 7,
+    // 105s, loop=0 on this path) starting here ~50ms after
+    // playSoundBig(7) -- two copies of the song playing on top of each other.
+    if (gBig.smp && gBig.sndId == sndId && !gBig.paused) {
+        pthread_mutex_unlock(&gLock);
+        return;
+    }
     // Dedup: SampleStartIfNotPlaying-style callers re-fire while the sound
     // is already live. Refresh vol/pitch/loop but do NOT reset pos -- a
     // restart on every re-fire is a stutter/buzz at the re-fire rate.
@@ -639,6 +670,18 @@ void audio_play_sound(int sndId, int instance, float vol, float pitch, int loop)
         if (!v) v = &gVoices[0];
     }
 
+    // Diagnostic: which sndId starts a fresh voice (dedup refreshes above
+    // don't count). Throttled per sndId so a sound the engine re-fires every
+    // few frames shows up once a second, not per frame -- enough to identify
+    // an unexplained loop from the console log.
+    // (Logged after unlocking -- never do log I/O while holding gLock, the
+    // mixer thread blocks on it.)
+    static SceUInt64 last_log_us[MAX_SOUNDS];
+    SceUInt64 now = sceKernelGetProcessTimeWide();
+    bool log_start = sndId >= 0 && sndId < MAX_SOUNDS && now - last_log_us[sndId] > 1000000;
+    if (log_start)
+        last_log_us[sndId] = now;
+
     voice_set_step(v, s->rate, pitch > 0.0f ? pitch : 1.0f);
     v->pos_int = 0;
     v->pos_frac = 0;
@@ -655,6 +698,9 @@ void audio_play_sound(int sndId, int instance, float vol, float pitch, int loop)
     v->instance = instance;
     v->smp = s;
     pthread_mutex_unlock(&gLock);
+    if (log_start)
+        l_info("[audio] start sndId=%d loop=%d vol=%.2f pitch=%.2f frames=%u",
+               sndId, loop, (double) vol, (double) pitch, s->frames);
 }
 
 void audio_play_sound_big(int sndId, float vol, int loop) {
@@ -667,6 +713,11 @@ void audio_play_sound_big(int sndId, float vol, int loop) {
     if (vol > 1.0f) vol = 1.0f;
 
     pthread_mutex_lock(&gLock);
+    // Same song already started on a pool voice (the reverse order of the
+    // dedup in audio_play_sound()): drop that copy, the big voice owns it.
+    for (int i = 0; i < MAX_VOICES; i++)
+        if (gVoices[i].smp && gVoices[i].sndId == sndId)
+            gVoices[i].smp = NULL;
     double step_d = (double) s->rate / (double) MIX_RATE;
     gBig.step_int = (unsigned int) step_d;
     gBig.step_frac = (unsigned int) ((step_d - (double)gBig.step_int) * 4294967296.0);
@@ -845,6 +896,8 @@ void GLMediaPlayer_setVolume(jmethodID id, va_list args) {
     int sndId = va_arg(args, jint);
     int instance = va_arg(args, jint);
     float vol = (float) va_arg(args, double);
+    if (gAmbientScope)
+        vol = ambient_shape(vol);
     audio_set_voice_volume(sndId, instance, vol);
 }
 
